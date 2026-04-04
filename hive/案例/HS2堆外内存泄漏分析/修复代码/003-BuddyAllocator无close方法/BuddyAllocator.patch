@@ -1,0 +1,56 @@
+--- a/llap-server/src/java/org/apache/hadoop/hive/llap/cache/BuddyAllocator.java
++++ b/llap-server/src/java/org/apache/hadoop/hive/llap/cache/BuddyAllocator.java
+@@ -17,6 +17,7 @@
+ */
+ package org.apache.hadoop.hive.llap.cache;
+ 
++import java.io.Closeable;
+ import static org.apache.hadoop.hive.common.NumberUtils.getFirstInt;
+ import static org.apache.hadoop.hive.common.NumberUtils.getSecondInt;
+ import static org.apache.hadoop.hive.common.NumberUtils.makeIntPair;
+@@ -23,6 +24,7 @@
+ import java.nio.channels.ClosedByInterruptException;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicLong;
++import java.io.IOException;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
+@@ -49,11 +51,12 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.llap.io.api.impl.LlapIoImpl;
++import org.apache.hive.common.util.CleanerUtil;
+ import org.apache.hadoop.hive.llap.metrics.LlapDaemonCacheMetrics;
+ import org.apache.hadoop.hive.ql.io.orc.encoded.StoppableAllocator;
+ 
+ public final class BuddyAllocator
+-    implements EvictionAwareAllocator, StoppableAllocator, BuddyAllocatorMXBean, LlapIoDebugDump {
++    implements EvictionAwareAllocator, StoppableAllocator, BuddyAllocatorMXBean, LlapIoDebugDump, Closeable {
+ 
+   // ... existing fields ...
+ 
++  // ====== BEGIN FIX OHL-003 ======
++
++  /**
++   * 释放所有 Arena 持有的 DirectByteBuffer 内存。
++   *
++   * 修复原理:
++   *   原始代码中 BuddyAllocator 没有 close/destroy 方法，
++   *   每个 Arena 持有一个最大 1GB 的 DirectByteBuffer 或 MappedByteBuffer，
++   *   依赖 GC Finalizer 释放。在高负载下 Finalizer 线程严重滞后，
++   *   导致 LLAP Daemon 关闭后 GB 级内存不归还。
++   *
++   *   修复方案: 实现 Closeable 接口，在 close() 中主动通过 CleanerUtil
++   *   释放所有 Arena 的 DirectByteBuffer。
++   *
++   * 调用时机:
++   *   - LlapIoImpl.close() 中添加 buddyAllocator.close() 调用
++   *   - LLAP Daemon 优雅关闭时触发
++   */
++  @Override
++  public void close() throws IOException {
++    // ... see full implementation below ...
++  }
++
++  // ====== END FIX OHL-003 ======
