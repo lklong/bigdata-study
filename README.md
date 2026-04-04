@@ -1,46 +1,46 @@
 # 大数据源码学习 & 排障知识库
 
 > **作者**: Kailong Liu | **AI 助手**: Eric
-> **方法论**: [源码精通方法论 v2.0 — 科学家级别](./spark/源码/00-学习方法论-v2.md)
+> **方法论**: [源码精通方法论 v2.0](./spark/源码/学习方法论.md) — 九大法则 + 四段位 + 90天路线图
 
 ---
 
 ## 目录结构
 
-每个组件下设 `源码/`（源码深度分析）和 `案例/`（线上排障案例）两个子目录。
+每个组件下设 `源码/`（源码深度分析）和 `案例/`（线上排障案例）。
 
-| 组件 | 源码分析 | 排障案例 | 说明 |
-|------|---------|---------|------|
-| [spark/](./spark/) | ✅ 内存管理、Shuffle、调度、SQL/Catalyst/AQE、全局架构地图 | — | Spark 3.5.1 |
-| [hive/](./hive/) | — | ✅ HS2/HMS Bug 知识库(27+泄漏点)、Hang 分析(10场景)、堆外泄漏、自研修复 | Hive 2.3.x / 3.x |
-| [kyuubi/](./kyuubi/) | — | ✅ 排障手册、诊断脚本、孤儿 Spark App 清理 | Kyuubi |
-| [amoro/](./amoro/) | — | — | 待补充 |
-| [hdfs/](./hdfs/) | — | — | 待补充 |
-| [yarn/](./yarn/) | — | ✅ NM 堆外内存泄漏分析、Shuffle 泄漏检测 | YARN NM |
+| 组件 | 源码 | 案例 | 说明 |
+|------|------|------|------|
+| [spark/](./spark/) | ✅ 内存管理、Shuffle、调度、SQL/AQE、全局架构地图 | — | Spark 3.5.1 |
+| [hive/](./hive/) | ✅ 基础、深度分析、源码地图 | ✅ HS2 Bug(7大类)、查询卡住(10场景)、堆外泄漏、查询结果错误 | Hive 2.3/3.x |
+| [kyuubi/](./kyuubi/) | ✅ 源码分析 | ✅ 排障手册、诊断脚本、推荐配置 | Kyuubi |
+| [yarn/](./yarn/) | ✅ 源码分析 | ✅ NM 堆外内存泄漏分析 | YARN |
+| [hdfs/](./hdfs/) | ✅ 源码分析 | — | HDFS |
+| [amoro/](./amoro/) | ✅ 源码分析 | — | Amoro |
 | [tez/](./tez/) | — | — | 待补充 |
-| [kerberos/](./kerberos/) | — | — | 待补充 |
-| [ldap/](./ldap/) | — | — | 待补充 |
-| [ranger/](./ranger/) | — | — | 待补充 |
+| [kerberos/](./kerberos/) | ✅ 原理与排障 | — | Kerberos |
+| [ldap/](./ldap/) | ✅ 原理与排障 | — | LDAP |
+| [ranger/](./ranger/) | ✅ 源码分析 | — | Ranger |
 
 ---
 
 ## 快速导航
 
 ### Spark
-- [全局架构地图](./spark/源码/05-全局架构地图.md) — 核心类速查 + SQL 流水线 + Shuffle + 调度
-- [内存管理源码分析](./spark/源码/01-memory-management.md) — UnifiedMemoryManager 逐行分析
-- [Shuffle 源码分析](./spark/源码/02-shuffle.md) — 三路写入 + 读取流控
-- [调度系统源码分析](./spark/源码/03-scheduler.md) — DAGScheduler + TaskSchedulerImpl
-- [SQL/Catalyst/AQE](./spark/源码/04-sql-catalyst-aqe.md) — QueryExecution 完整链路
+- [全局架构地图](./spark/源码/05-全局架构地图.md) — 核心类 + SQL 流水线 + Shuffle + 调度
+- [内存管理](./spark/源码/01-内存管理.md) — UnifiedMemoryManager 逐行分析
+- [Shuffle 机制](./spark/源码/02-Shuffle机制.md) — 三路写入 + 读取流控
+- [调度系统](./spark/源码/03-调度系统.md) — DAGScheduler + TaskSchedulerImpl
+- [SQL 引擎与 AQE](./spark/源码/04-SQL引擎与AQE.md) — QueryExecution 完整链路
 
 ### Hive
-- [HS2/HMS Bug 知识库总览](./hive/案例/00-summary.md) — 6 大类 50+ Bug
-- [堆外内存泄漏 27 个点](./hive/案例/01-offheap-memory-leak.md)
-- [Hive Hang 全面分析](./hive/案例/hive-hang-analysis/00-overview.md) — 10 大卡住场景
-- [自研修复方案](./hive/案例/08-self-developed-fixes.md) — Top 3 P0 Bug
-
-### YARN
-- [NM 堆外内存泄漏分析](./yarn/案例/report/full-analysis-report.md)
+- [HS2 堆外内存泄漏](./hive/案例/HS2堆外内存泄漏分析/分析报告.md) — 27 个泄漏点 + 修复补丁
+- [Hive 查询卡住全面分析](./hive/案例/Hive查询卡住分析/分析报告.md) — 10 大卡住场景
+- [HS2 死锁与锁竞争](./hive/案例/HS2死锁与锁竞争/分析报告.md)
+- [HS2 查询结果不对](./hive/案例/HS2查询结果不对排障/分析报告.md)
 
 ### Kyuubi
-- [Kyuubi 排障手册](./kyuubi/案例/README.md)
+- [Kyuubi 排障手册](./kyuubi/案例/Kyuubi问题排查/分析报告.md)
+
+### YARN
+- [NM 堆外内存泄漏分析](./yarn/案例/NM堆外内存泄漏分析/分析报告.md)
