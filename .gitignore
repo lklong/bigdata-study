@@ -1,5 +1,6 @@
-# Hive source code (too large, reference only)
-hive/
+# 源码目录（太大，不推送）
+/spark-source/
+/hive-source/
 
 # IDE and tool files
 .codebuddy/
