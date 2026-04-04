@@ -1,0 +1,8 @@
+# Hive source code (too large, reference only)
+hive/
+
+# IDE and tool files
+.codebuddy/
+.idea/
+*.iml
+.DS_Store
