@@ -1,8 +1,43 @@
-# Apache Kyuubi — 源码级深度知识手册
+# Apache Kyuubi — 源码级深度知识手册（L4 创造者/科学家级）
 
-> 最后更新：2026-04-04 | 作者：豹纹（BigData Ops Orchestrator）
-> 源码版本：master 分支 (ba854d3c)
-> 学习方法：直接阅读 GitHub 源码 + 官方文档 + 社区深度解析
+> **最后更新**：2026-04-05 | **作者**：Eric（BigData Ops Orchestrator）
+> **源码版本**：master 分支 (ba854d3c, 2026-04)
+> **段位目标**：L4 创造者/科学家 — 能写 SPIP、能提 PR、能做架构级 Review
+> **方法论**：源码精通九大法则 × 费曼三层输出
+
+---
+
+## L4 文档体系索引
+
+> 所有文档均按"费曼三层（白话→架构→论文）+ 对抗性分析 + 考古追溯 + 知识晶体化"标准编写。
+
+### 源码深度分析系列
+
+| 序号 | 文档 | 核心模块 | L4 特色 |
+|------|------|---------|---------|
+| 01 | [Service 抽象层与 KyuubiServer 启动链路](01-Service抽象层与KyuubiServer启动链路.md) | Service 状态机、CompositeService、Serverable、启动/停机链路 | 状态机形式化证明、启动回滚正确性、与 Spring/OSGi 对比 |
+| 02 | [Session 管理与 EngineRef 引擎管理](02-Session管理与EngineRef引擎管理源码深度分析.md) | SessionManager、限流、EngineRef.getOrCreate、分布式锁、引擎池 | 调度模型形式化、引擎启动延迟模型、POLLING 溢出 Bug 考古 |
+| 02 | [SparkSQLEngine 与 Operation 管理](02-SparkSQLEngine与Operation管理源码深度分析.md) | SparkSQLEngine、ExecuteStatement、结果集三种模式、WatchDog | Session 隔离内存模型、SQL 延迟分析、OOM 对抗性分析 |
+| 05 | [HA / Events / Metrics](05-HA-Events-Metrics源码深度分析.md) | ZK 服务发现、EventBus、Prometheus 指标 | CAP 分析、ZK 脑裂对抗、EventBus 阻塞风险 |
+| — | **本文（总纲）** | 全模块端到端串联 | 21 章完整请求生命周期 |
+
+### 运维与实战系列
+
+| 文档 | 内容 | L4 特色 |
+|------|------|---------|
+| [异常场景 + 配置参数 + Bug 考古](../异常场景-配置参数-Bug考古.md) | 10+ 异常场景的源码级根因分析 | Top 5 危险配置 + Top 5 隐蔽 Bug + JIRA 考古 |
+
+### 待补写（P1-P4）
+
+| 文档 | 状态 | 说明 |
+|------|------|------|
+| 03-REST-API 与 JDBC 协议层 | 计划中 | REST Frontend / Thrift HTTP / MySQL Protocol |
+| 04-认证鉴权体系 | 计划中 | SASL/GSSAPI/Kerberos/LDAP + Ranger 授权 |
+| 06-性能建模与容量规划 | 计划中 | Amdahl 建模 + 引擎启动延迟公式 + 容量计算 |
+| 07-跨项目同构对比 | 计划中 | Kyuubi vs HS2 vs Flink SQL Gateway vs Trino Gateway |
+| 案例/Bug 复现 | 计划中 | 3 个高价值 JIRA 的源码级复现 |
+| 案例/PR Review | 计划中 | 3 个社区 PR 的深度 Review |
+| 案例/SPIP 设计方案 | 计划中 | 引擎池动态扩缩容设计方案 |
 
 ---
 
