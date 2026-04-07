@@ -377,5 +377,161 @@ K8s 比 YARN 慢 8% 的 325 秒分解：
 
 ---
 
+---
+
+## 第九部分：Job 3 / Stage 3 聚焦深度分析
+
+> 所有性能差距集中在 Stage 3（34,466 tasks, `save at ExecuteStatement.scala:197`），Stage 0-2 K8s 反而更快。
+
+### 9.1 全 Stage 耗时对比
+
+| Stage | 内容 | YARN | K8s | 差异 |
+|-------|------|------|-----|------|
+| 0 | isEmpty (1 task) | 2.1s | 1.8s | **K8s 快 0.3s** |
+| 1 | shouldSaveResultToFs (2 tasks) | 15.4s | 10.0s | **K8s 快 5.4s** |
+| 2 | shouldSaveResultToFs (2 tasks) | 8.2s | 8.0s | **K8s 快 0.2s** |
+| **3** | **save (34466 tasks)** | **4094.1s** | **4419.4s** | **K8s 慢 325.3s** |
+
+**结论**：Stage 0-2 共 5 个 task，K8s 反而快 5.9s（Pod JVM 更干净）。**100% 的性能差距来自 Stage 3**。
+
+### 9.2 Stage 3 — executorCpuTime 精确拆解
+
+Event Log 中的 `executorCpuTime` 是 JVM 通过 `ManagementFactory.getThreadMXBean().getCurrentThreadCpuTime()` 统计的**真实 CPU 消耗纳秒数**，不含 I/O 等待、睡眠、GC 暂停。
+
+| 指标 | YARN | K8s | 差异 | 差异% |
+|------|------|-----|------|-------|
+| **executorRunTime (wall clock)** | **402,305s** | **437,176s** | **+34,871s** | **+8.7%** |
+| **executorCpuTime (real CPU)** | **133,115s** | **139,264s** | **+6,149s** | **+4.6%** |
+| **jvmGCTime** | **6,482s** | **7,781s** | **+1,299s** | **+20.0%** |
+| **I/O 等待 (wall - cpu)** | **269,190s** | **297,912s** | **+28,722s** | **+10.7%** |
+
+### 9.3 34,871 秒差距精确分解
+
+```
+executorRunTime 总差距: 34,871s
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │                                                              │
+  │  I/O 等待增加        ████████████████████████████  +28,722s  (82.4%)
+  │  (wall - cpu 差异)   COS HTTP GET / 网络 / CNI / 磁盘       │
+  │                                                              │
+  │  CPU 计算变慢        █████                         +6,149s   (17.6%)
+  │  (executorCpuTime)   cgroup CFS throttle / JIT / GC STW     │
+  │                                                              │
+  │  其中 GC 贡献:       ██                            +1,299s   │
+  │  (包含在上面两项中)   ParallelGCThreads 1 vs 8               │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+**这是最精确的分解**：
+- **82.4% 是 I/O 等待增加** — 纯粹的网络/存储延迟，不是 CPU 问题
+- **17.6% 是 CPU 计算变慢** — 包括 GC、JIT、cgroup throttle
+
+### 9.4 CPU 利用率对比
+
+```
+K8s  CPU利用率 = executorCpuTime / executorRunTime = 139,264 / 437,176 = 31.8%
+YARN CPU利用率 = executorCpuTime / executorRunTime = 133,115 / 402,305 = 33.1%
+```
+
+两端都只有 ~32% 的时间在做 CPU 计算，**~68% 在等 I/O**。这是典型的 I/O bound 任务（从 COS 读 12.6 TB 数据）。
+
+K8s 的 CPU 利用率略低（31.8% vs 33.1%），说明 K8s 端 **I/O 等待比例更高**。
+
+### 9.5 按 Executor 维度分析
+
+**K8s** — 100 个 Executor 非常均匀：
+```
+最慢 Exec 82:  avg_run=13,172ms  avg_gc=240ms  331 tasks  121.6GB
+最快 Exec  7:  avg_run=12,174ms  avg_gc=185ms  360 tasks  132.6GB
+全局平均:      avg_run=12,696ms  avg_gc=226ms
+极差(最慢-最快): 998ms (7.6%) ← 非常均匀，无倾斜
+```
+
+**关键发现**：
+- 最快和最慢 executor 差异只有 ~8%，不存在数据倾斜
+- 慢的 executor 反而处理的数据更少（121.6GB vs 132.6GB），说明不是数据量导致的慢，而是**底层 I/O 或 Node 差异**
+- 所有 executor wall time 都在 4365-4403s，非常接近 Stage 总耗时（4419s），说明负载均衡很好
+
+### 9.6 数据一致性验证
+
+| 指标 | YARN | K8s | 是否一致 |
+|------|------|-----|---------|
+| input.bytesRead | 13,596,474,161,299 | 13,596,474,161,299 | **完全一致** |
+| input.recordsRead | 110,341,647,622 | 110,341,647,622 | **完全一致** |
+| number of input batches | 27,018,725 | 27,018,725 | **完全一致** |
+| output.bytesWritten | 3,757 | 3,757 | **完全一致** |
+| output.recordsWritten | 1 | 1 | **完全一致** |
+| number of output rows | 55,174,619,592 | 55,174,619,592 | **完全一致** |
+
+数据完全一致，确认是同一条 SQL、同一份数据、相同的计算逻辑。
+
+---
+
+## 第十部分：Challenger 审查
+
+### 🔍 自审：对本报告的质疑
+
+```
+🔍 Challenger 审查报告
+━━━━━━━━━━━━━━━━━━━━━━
+
+📋 审查对象: K8s vs YARN 性能分析报告 V5
+🔎 审查结果: ⚠️ CONDITIONAL
+
+━━━ 证据质疑 ━━━
+
+🟢 已消除: zstd 解压方式差异
+   源码验证 ORC 1.7.8 用 aircompressor 纯 Java, 两端完全相同 — 证据链完整
+
+🟢 已消除: GC ParallelGCThreads 差异
+   Event Log 中 jvmGCTime 差 +1,299s (+20%), JVM flags 确认 1 vs 8 — 证据链完整
+
+🟢 新增: executorCpuTime 拆解
+   CPU 计算只差 +6,149s (17.6%), I/O 等待差 +28,722s (82.4%)
+   — 精确到 JVM 级别的 CPU 时间统计, 证据可靠
+
+🟡 待验证: "I/O 等待增加 82.4% 是 COS 网络导致"
+   质疑: executorCpuTime 不含 I/O, 但也不含 GC STW
+   所以 "I/O 等待 = wall - cpu" 实际包含了:
+     a) COS HTTP GET 网络等待 ← 主要部分
+     b) GC STW 暂停 (已知 +1,299s)
+     c) 线程调度/上下文切换
+     d) 磁盘 I/O (写 /var/data)
+   扣除 GC: 28,722 - 1,299 = 27,423s 才是真正的 I/O + 系统开销
+
+   验证方法: 在 K8s Pod 和 YARN Node 上做 COS 带宽 benchmark
+
+🟡 待验证: "cgroup CFS throttle 导致 CPU 计算变慢"
+   质疑: limit.cores=2 (不是 1), CFS quota 应该是 200ms/100ms
+   如果 executor 只用 1 core (spark.executor.cores=1), 不应该被 throttle
+   除非: GC 线程 + JIT 编译线程 + task 线程同时运行超过 2 core
+   
+   验证方法: 检查 K8s Node 上的 /sys/fs/cgroup/.../cpu.stat 中的 nr_throttled
+
+━━━ 安全审查 ━━━
+
+🟢 SAFE: -XX:ParallelGCThreads=8
+   只影响 GC 线程数, 不影响功能, 可秒级回滚(改配置重提交)
+
+🟢 SAFE: spark.dynamicAllocation.initialExecutors=100  
+   只影响初始 executor 数, 不影响已运行任务
+
+🟡 CAUTION: spark.kubernetes.executor.limit.cores=4
+   会消耗更多集群 CPU quota, 建议先在测试队列验证
+   回滚方法: 改回 limit.cores=2 重提交
+
+🟡 CAUTION: hostNetwork=true (via Pod Template)
+   可能有端口冲突风险, 建议在独立节点池先验证
+   回滚方法: 删除 podTemplateFile 配置
+
+━━━ 裁决 ━━━
+⚠️ CONDITIONAL — 核心结论可信(I/O 等待是主因), 但 COS 带宽 benchmark 是关键验证项
+```
+
+---
+
 *基于 Executor Log + Event Log + Spark 3.3.2 源码 (`emr-3.3.2-zyb` 分支) 三源交叉分析*
+*Challenger 安全审查通过 (CONDITIONAL) — 待 COS benchmark 验证*
 *Eric (豹纹) | Spark Expert | 2026-04-08*
