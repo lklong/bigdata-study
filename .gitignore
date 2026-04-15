@@ -7,3 +7,7 @@
 .idea/
 *.iml
 .DS_Store
+spark/案例/k8s-vs-yarn-performance/k8s-new/
+spark/案例/k8s-vs-yarn-performance/yarn/
+spark/案例/k8s-vs-yarn-performance/k8s-logs/
+*.log

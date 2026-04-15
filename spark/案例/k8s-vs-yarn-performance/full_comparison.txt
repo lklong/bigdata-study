@@ -1,0 +1,83 @@
+解析 YARN (4/7) ...
+解析 K8s-old (4/7) ...
+解析 K8s-d877 (4/14 早) ...
+解析 K8s-5c99 (4/14 晚) ...
+
+========================================================================================================================
+  全量 Spark 应用执行情况对比（YARN vs K8s）
+========================================================================================================================
+
+指标                                             YARN (4/7)         K8s-old (4/7)     K8s-d877 (4/14 早)     K8s-5c99 (4/14 晚)
+---------------------------------------------------------------------------------------------------------------------------
+Platform                                             YARN                   K8s                   K8s                   K8s
+App Name                                     cql_test_$ds          cql_test_$ds          cql_test_$ds             cql_test_
+Start Time                            2026-04-07 13:14:00   2026-04-07 13:28:17   2026-04-14 19:48:46   2026-04-14 22:06:12
+End Time                              2026-04-07 17:37:59   2026-04-07 15:45:45   2026-04-14 21:14:42   2026-04-14 23:29:34
+Total Duration                                      4.40h                 2.29h                 1.43h                 1.39h
+Executors                                             102                   100                   101                   100
+Executor Memory                                     2560M                 2560M                 2560M                 2560M
+Executor Cores                                          1                     1                     1                     1
+Shuffle Manager                                  Built-in              Celeborn              Celeborn              Celeborn
+COS Impl                              NativeCosFileSystemTemrfsHadoopFileSystemAdapterTemrfsHadoopFileSystemAdapter   NativeCosFileSystem
+Read Ahead Block                                  2097152                   N/A                   N/A               2097152
+Region                                     zyb-ap-beijing                    bj                    bj        zyb-ap-beijing
+Jobs                                                    4                     4                     4                     4
+Stages                                                  4                     4                     4                     4
+Tasks                                              34,471                34,471                34,471                34,471
+Failed Tasks                                            0                     0                     0                     0
+Speculative Tasks                                       0                     0                     0                     0
+
+Task Duration avg                                   11.7s                 12.7s                 12.7s                 11.3s
+Task Duration p50                                   11.4s                 12.6s                 12.6s                 11.1s
+Task Duration p90                                   13.6s                 14.1s                 14.2s                 12.5s
+Task Duration p99                                   19.7s                 19.8s                 21.8s                 18.9s
+Task Duration max                                   34.6s                 28.8s                 29.7s                 25.9s
+
+Executor RunTime total                            111.76h               121.44h               121.80h               107.81h
+CPU Time total                                     36.98h                38.69h                31.21h                31.60h
+GC Time total                                       1.80h                 2.16h                 2.46h                 2.24h
+GC %                                                1.61%                 1.78%                 2.02%                 2.08%
+GC avg                                              188ms                 226ms                 257ms                 234ms
+GC p99                                              377ms                 405ms                 427ms                 438ms
+GC max                                               1.2s                  1.0s                 846ms                 747ms
+
+Input Bytes total                                 12.4 TB               12.4 TB               12.4 TB               12.4 TB
+Input avg/task                                   376.2 MB              376.2 MB              376.2 MB              376.2 MB
+Output Bytes total                                 3.7 KB                3.7 KB                3.7 KB                3.7 KB
+Shuffle Read total                                    0 B                   0 B                   0 B                   0 B
+Shuffle Write total                                   0 B                   0 B                   0 B                   0 B
+Shuffle Fetch Wait avg                                0ms                   0ms                   0ms                   0ms
+Shuffle Remote %                                    0.00%                 0.00%                 0.00%                 0.00%
+
+Memory Spill total                                    0 B                   0 B                   0 B                   0 B
+Disk Spill total                                      0 B                   0 B                   0 B                   0 B
+Peak Exec Memory avg                                  0 B                   0 B                   0 B                   0 B
+Deserialize avg                                      19ms                  12ms                  13ms                  13ms
+Skew ratio (max/p50)                                3.04%                 2.28%                 2.36%                 2.33%
+
+========================================================================================================================
+  Job 级别对比
+========================================================================================================================
+
+Job 0                                         2.1s (JobS)           1.9s (JobS)           3.0s (JobS)           2.7s (JobS)
+Job 1                                        15.4s (JobS)          10.1s (JobS)           9.1s (JobS)          10.0s (JobS)
+Job 2                                         8.2s (JobS)           8.0s (JobS)           9.3s (JobS)           8.8s (JobS)
+Job 3                                        1.14h (JobS)          1.23h (JobS)          1.23h (JobS)          1.09h (JobS)
+
+========================================================================================================================
+  Stage 级别对比
+========================================================================================================================
+
+Stage 0                                          2.1s(1t)              1.8s(1t)              3.0s(1t)              2.6s(1t)
+Stage 1                                         15.4s(2t)             10.0s(2t)              9.1s(2t)             10.0s(2t)
+Stage 2                                          8.2s(2t)              8.0s(2t)              9.3s(2t)              8.8s(2t)
+Stage 3                                     1.14h(34466t)         1.23h(34466t)         1.23h(34466t)         1.09h(34466t)
+
+========================================================================================================================
+  SQL 信息
+========================================================================================================================
+
+  YARN (4/7): SELECT `command_no`,`uniq_id`,`attach_id`,`ext_id`,`uid`,`title`,`content`,`pic_list`,`uip`,`ac_ext`,`status`,`audit_id`,`operator`,0 as `version_id`,
+  K8s-old (4/7): SELECT `command_no`,`uniq_id`,`attach_id`,`ext_id`,`uid`,`title`,`content`,`pic_list`,`uip`,`ac_ext`,`status`,`audit_id`,`operator`,0 as `version_id`,
+  K8s-d877 (4/14 早): SELECT `command_no`,`uniq_id`,`attach_id`,`ext_id`,`uid`,`title`,`content`,`pic_list`,`uip`,`ac_ext`,`status`,`audit_id`,`operator`,0 as `version_id`,
+  K8s-5c99 (4/14 晚): SELECT `command_no`,`uniq_id`,`attach_id`,`ext_id`,`uid`,`title`,`content`,`pic_list`,`uip`,`ac_ext`,`status`,`audit_id`,`operator`,0 as `version_id`,
