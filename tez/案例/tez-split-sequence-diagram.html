@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tez 分片计算全流程时序图（源码级）</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0f1219;
+    color: #c9d1d9;
+    padding: 32px 16px;
+  }
+  h1 { text-align: center; color: #58a6ff; font-size: 1.5em; margin-bottom: 6px; }
+  .subtitle { text-align: center; color: #8b949e; font-size: 0.85em; margin-bottom: 28px; }
+  .mermaid-wrap {
+    max-width: 1200px;
+    margin: 0 auto;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 32px 20px;
+    overflow-x: auto;
+  }
+  .legend {
+    max-width: 1200px;
+    margin: 24px auto 0;
+    padding: 16px 24px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    font-size: 0.8em;
+    color: #8b949e;
+    line-height: 1.8;
+  }
+  .legend b { color: #c9d1d9; }
+  .legend code { background: #21262d; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; color: #e3b341; }
+  .legend .row { display: flex; gap: 8px; margin: 2px 0; }
+  .legend .cls { color: #79c0ff; min-width: 340px; }
+  .legend .desc { color: #8b949e; }
+</style>
+</head>
+<body>
+
+<h1>Tez 分片计算全流程时序图（源码级）</h1>
+<p class="subtitle">Hive 3.1.3 + Tez 0.10.2 &nbsp;|&nbsp; 每步标注 类名.方法名()</p>
+
+<div class="mermaid-wrap">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant HS2 as HiveServer2
+    participant RM as YARN RM
+    participant AM as DAGAppMaster
+    participant HSG as HiveSplitGenerator
+    participant SGr as SplitGrouper
+    participant TG as TezSplitGrouper
+
+    rect rgba(56,139,253,0.07)
+    Note over HS2,RM: 【阶段1】HS2 提交 App
+    HS2->>RM: TezClient.submitApplication()<br/>→ YarnClientImpl.submitApplication()
+    RM-->>HS2: App 进入 CapacityScheduler 队列排队
+    Note over HS2,RM: 682541: 00:20:04 等~7min<br/>683560: 03:51:36 等~20min
+    end
+
+    rect rgba(248,81,73,0.07)
+    Note over RM,AM: 【阶段2】AM 启动 + 注册（5层调用链）
+    RM->>AM: NodeManager.startContainers()<br/>→ DAGAppMaster.main() L219
+    AM->>AM: DAGAppMaster.serviceInit() L427<br/>→ createTaskSchedulerManager()<br/>→ addIfService(taskSchedulerManager) L576
+    AM->>AM: DAGAppMaster.serviceStart() L1927<br/>→ startServices() L1929<br/>为每个注册的service创建ServiceThread并行启动
+    Note over AM: ↓ 第1层: 并行启动
+    AM->>AM: ServiceThread.run() L1801<br/>→ ServiceWithDependency.start() L1762<br/>等待依赖就绪后调 service.start() L1786
+    Note over AM: ↓ 第2层: Hadoop模板方法模式
+    AM->>AM: AbstractService.start() L184<br/>(org.apache.hadoop.service)<br/>① isInState(STARTED) 快速检查<br/>② synchronized(stateChangeLock)<br/>③ stateModel.enterState(STARTED)<br/>状态转换 INITED→STARTED<br/>④ 调子类 serviceStart() ★<br/>⑤ notifyListeners()
+    Note over AM: ↓ 第3层: TaskSchedulerManager
+    AM->>AM: TaskSchedulerManager<br/>.serviceStart() L643<br/>→ instantiateSchedulers() L653<br/>反射创建 YarnTaskSchedulerService
+    Note over AM: ↓ 第3层: 适配器 init+start
+    AM->>AM: ServicePluginLifecycleAbstractService<br/>.serviceInit() L35<br/>→ YarnTaskSchedulerService<br/>.initialize() L278<br/>→ amRmClient.init(conf) L281
+    Note over AM: ↓ 第4层: 真正启动
+    AM->>AM: ServicePluginLifecycleAbstractService<br/>.serviceStart() L40<br/>→ YarnTaskSchedulerService<br/>.start() L361
+    Note over AM: ↓ 第5层: 连接 RM
+    AM->>RM: YarnTaskSchedulerService<br/>.start() L365-368<br/>→ amRmClient.start()<br/>→ amRmClient<br/>.registerApplicationMaster(<br/>appHostName, appHostPort,<br/>appTrackingUrl)
+    RM-->>AM: RegisterApplicationMasterResponse<br/>(maxResourceCapability, queue)<br/>注意: 不含 headroom
+    Note over AM: amRmClient 创建于构造函数 L223:<br/>TezAMRMClientAsync.createAMRMClientAsync(<br/>1000, this)<br/>底层=AMRMClientImpl + 心跳线程
+    end
+
+    rect rgba(210,153,34,0.15)
+    Note over RM,AM: 【阶段3】★ 第一次心跳 totalResources 确定 ★
+    AM->>RM: AMRMClientAsync.HeartbeatThread<br/>.run() → amRmClient.allocate(0)
+    RM->>RM: CapacityScheduler<br/>.allocate()<br/>计算 headroom =<br/>min(userLimit-userUsed,<br/>queueCap-queueUsed)
+    RM-->>AM: AllocateResponse<br/>{availableResources=headroom,<br/>allocatedContainers=[]}
+    AM->>AM: YarnTaskSchedulerService<br/>.getProgress() L901<br/>if(totalResources.getMemory()==0)<br/>totalResources =<br/>Resources.clone(<br/>getAvailableResources())
+    Note over AM: ★ 赋值一次不再更新 ★<br/>682541(00:26): headroom小→A<br/>683560(04:11): headroom大→B≈2A
+    end
+
+    rect rgba(56,139,253,0.07)
+    Note over HS2,AM: 【阶段4】提交 PreWarm DAG（与阶段5走完全相同的路径）
+    HS2->>HS2: TezClient.preWarm() L921<br/>→ DAG.create("TezPreWarmDAG_0")<br/>→ TezClient.submitDAG()
+    HS2->>HS2: TezClient.submitDAGSession() L647<br/>→ TezClientUtils<br/>.prepareAndCreateDAGPlan()<br/>→ 构建 SubmitDAGRequestProto
+    HS2->>AM: FrameworkClient.submitDag() L111<br/>→ proxy.submitDAG(null, request)<br/>====== RPC 网络边界 ======
+    Note right of HS2: 682541: 00:26:54<br/>683560: 04:11:46
+    AM->>AM: DAGClientAMProtocol<br/>BlockingPBServerImpl<br/>.submitDAG() L160<br/>→ 解析 DAGPlan
+    AM->>AM: DAGClientHandler<br/>.submitDAG() L139<br/>→ dagAppMaster<br/>.submitDAGToAppMaster()
+    AM->>AM: DAGAppMaster<br/>.submitDAGToAppMaster() L1287<br/>→ PreWarm不计入submittedDAGs<br/>→ startDAG(dagPlan) L1328
+    AM->>AM: DAGAppMaster.startDAG() L2463<br/>→ createDAG(dagPlan)<br/>→ startDAGExecution() L2538
+    AM->>AM: startDAGExecution() L2538<br/>→ dagEventDispatcher<br/>.handle(DAG_INIT) [同步]<br/>→ sendEvent(DAG_START) [异步]
+    AM->>AM: DAGImpl.InitTransition L1849<br/>→ initializeDAG()<br/>→ DAGState.INITED
+    AM-->>HS2: PreWarm DAG 完成
+    end
+
+    rect rgba(56,139,253,0.07)
+    Note over HS2,AM: 【阶段5】提交实际查询 DAG（同上路径）
+    HS2->>HS2: TezClient.submitDAG() L610<br/>→ submitDAGSession() L647<br/>→ 构建 SubmitDAGRequestProto
+    HS2->>AM: FrameworkClient.submitDag() L111<br/>→ proxy.submitDAG(null, request)<br/>====== RPC 网络边界 ======
+    Note right of HS2: 682541: 00:27:22<br/>683560: 04:12:05
+    AM->>AM: DAGClientAMProtocol<br/>BlockingPBServerImpl<br/>.submitDAG() L160
+    AM->>AM: DAGClientHandler<br/>.submitDAG() L139<br/>→ dagAppMaster<br/>.submitDAGToAppMaster() L1287
+    AM->>AM: DAGAppMaster<br/>.submitDAGToAppMaster()<br/>→ submittedDAGs.incrementAndGet()<br/>→ startDAG() → startDAGExecution()
+    AM->>AM: startDAGExecution() L2538<br/>dagEventDispatcher.handle(DAG_INIT)<br/>[同步] → startVertexServices()<br/>→ sendEvent(DAG_START) [异步]
+    end
+
+    rect rgba(210,153,34,0.15)
+    Note over AM,TG: 【阶段6】★★★ 切片计算 ★★★
+
+    AM->>AM: DAGImpl.handle(DAG_INIT)<br/>→ DAGImpl.InitTransition<br/>.transition()
+    AM->>AM: VertexImpl.handle(V_INIT)<br/>→ VertexImpl.InitTransition<br/>.transition()
+    AM->>AM: RootInputInitializerManager<br/>.runInputInitializers()<br/>→ executor.submit(<br/>InputInitializerCallable)
+
+    Note over AM,HSG: ── HiveSplitGenerator.initialize() 开始 ──
+
+    AM->>HSG: InputInitializerCallable<br/>.call()<br/>→ HiveSplitGenerator<br/>.initialize()
+
+    HSG->>HSG: ① 计算 availableSlots<br/>L186: totalResource =<br/>getContext()<br/>.getTotalAvailableResource()<br/>.getMemory()<br/>L188: taskResource =<br/>getContext()<br/>.getVertexTaskResource()<br/>.getMemory()<br/>L189: availableSlots =<br/>totalResource / taskResource
+    Note over HSG: 682541: slots=a<br/>683560: slots=b≈2a
+
+    HSG->>HSG: ② preferredSplitSize<br/>L273: if(MAPREDMINSPLITSIZE<=1)<br/>L276: blockSize = DFS_BLOCK_SIZE<br/>L280: minGrouping =<br/>TEZ_GROUPING_SPLIT_MIN_SIZE<br/>L285: preferredSplitSize =<br/>Math.min(blockSize/2,<br/>minGrouping)
+
+    HSG->>HSG: ③ 生成原始splits<br/>L311: inputFormat.getSplits(<br/>jobConf,<br/>(int)(availableSlots*waves))<br/>→ HiveInputFormat<br/>.getSplits(job, numSplits)
+
+    Note over HSG: HiveInputFormat.getSplits() 内部:<br/>→ getInputPaths() 按分区遍历<br/>→ addSplitsForGroup() L746<br/>→ OrcInputFormat.getSplits()<br/>→ FileInputFormat.getSplits()<br/>goalSize=totalSize/numSplits<br/>splitSize=max(minSize,<br/>min(goalSize,blockSize))
+
+    HSG->>HSG: ④ 排序<br/>L317: Arrays.sort(splits,<br/>new InputSplitComparator())<br/>降序大小→路径→偏移量
+
+    HSG->>SGr: ⑤ SplitGrouper<br/>.generateGroupedSplits()<br/>L333: splitGrouper<br/>.generateGroupedSplits(<br/>jobConf, conf, splits,<br/>waves, availableSlots,<br/>splitLocationProvider)
+
+    SGr->>SGr: generateGroupedSplits(6参→8参)<br/>L154→L164<br/>补 inputName=null,<br/>groupAcrossFiles=true
+
+    SGr->>SGr: schemaEvolved() L599<br/>按InputFormat/Deserializer<br/>变化分桶
+
+    SGr->>SGr: group() L72<br/>→ estimateBucketSizes(<br/>availableSlots, waves,<br/>bucketSplitMap) L203<br/>desiredNumSplits =<br/>(int)(availableSlots *<br/>waves * bucketSize /<br/>totalSize)
+
+    SGr->>TG: TezMapredSplitsGrouper<br/>.getGroupedSplits(<br/>conf, rawSplits,<br/>desiredNumSplits,<br/>HiveInputFormat.class,<br/>ColumnarSplitSizeEstimator,<br/>splitLocationProvider)
+
+    TG->>TG: L224: lengthPerGroup =<br/>totalLength / desiredNumSplits<br/>L239: if(lengthPerGroup ><br/>maxLengthPerGroup)<br/>→ 路径A: max-size兜底<br/>L245: if(lengthPerGroup <<br/>minLengthPerGroup)<br/>→ 路径B: min-size兜底<br/>L253: if(desiredNumSplits >=<br/>originalSplits.size())<br/>→ 路径C: 不分组<br/>否则 → 路径D: 按location<br/>多轮迭代分组
+
+    Note over TG: 682541: 路径A(max兜底)→246<br/>683560: 路径C(不分组)→487
+
+    TG-->>SGr: 返回 GroupedSplitContainer[]
+    SGr-->>HSG: 返回 Multimap groupedSplits
+    HSG->>HSG: ⑥ L338: flatSplits =<br/>groupedSplits.values()<br/>.toArray()
+
+    HSG->>HSG: ⑦ createEventList()<br/>→ InputConfigureVertexTasksEvent<br/>→ InputDataInformationEvent × N
+
+    HSG-->>AM: 返回 List of Event
+
+    Note over AM,HSG: ── HiveSplitGenerator.initialize() 结束 ──
+
+    AM->>AM: VertexImpl<br/>.handleInputInitializerEvent()<br/>→ setParallelism(Map数)
+    end
+
+    rect rgba(63,185,80,0.07)
+    Note over RM,AM: 【阶段7】调度 Container
+    AM->>RM: TaskSchedulerManager<br/>.allocateTask()<br/>→ AMRMClientAsync<br/>.addContainerRequest()
+    RM-->>AM: CapacityScheduler 按心跳分配
+    Note over RM,AM: 此时headroom已不同于阶段3!<br/>683560 DAG2: 487 Map 只拿到3并发<br/>683560 DAG3: 487并发全拉满
+    end
+
+    rect rgba(139,148,158,0.07)
+    Note over HS2,TG: 【阶段8】实际执行
+    Note over HS2,AM: 682541: Map=246 ~1min完成<br/>task_245 EOFException → FAILED<br/>DAG3重试→再次EOF<br/>00:28:51 Session关闭
+    Note over AM,TG: 683560: Map=487 DAG2并发=3<br/>71min跑完486个 task_485 EOF<br/>DAG3: 487并发 0完成(1h42m)<br/>→被用户kill 07:06:59
+    end
+</pre>
+</div>
+
+<div class="legend">
+  <b>完整调用链索引（全限定类名）：</b><br/><br/>
+  <div class="row"><span class="cls"><code>org.apache.tez.client.TezClient.submitApplication() L402</code></span><span class="desc">→ Session模式: 创建 YARN App, 启动 AM</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.DAGAppMaster.main()</code></span><span class="desc">→ AM 入口, 调 serviceInit/serviceStart</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.DAGAppMaster.serviceInit() L427</code></span><span class="desc">→ createTaskSchedulerManager() → addIfService(taskSchedulerManager) L576</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.DAGAppMaster.serviceStart() L1927</code></span><span class="desc">→ startServices() L1929: 为每个注册service创建ServiceThread并行启动</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.DAGAppMaster$ServiceThread.run() L1801</code></span><span class="desc">→ ServiceWithDependency.start() L1762: 等依赖就绪 → service.start() L1786</span></div>
+  <div class="row"><span class="cls"><code>org.apache.hadoop.service.AbstractService.start() L184</code></span><span class="desc">→ 模板方法: synchronized + stateModel.enterState(STARTED) + 调子类serviceStart() + notifyListeners()</span></div>
+  <div class="row"><span class="cls"><code>org.apache.hadoop.service.ServiceStateModel.enterState() L110</code></span><span class="desc">→ synchronized, 查statemap[INITED][STARTED]=true, 原子写state=STARTED</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.rm.TaskSchedulerManager.serviceStart() L643</code></span><span class="desc">→ instantiateSchedulers() L653: 反射创建 YarnTaskSchedulerService → wrapper.init/start</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.ServicePluginLifecycleAbstractService.serviceInit() L35</code></span><span class="desc">→ 适配器: 调 YarnTaskSchedulerService.initialize()</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.ServicePluginLifecycleAbstractService.serviceStart() L40</code></span><span class="desc">→ 适配器: 调 YarnTaskSchedulerService.start()</span></div>
+  <div class="row"><span class="cls"><code>o.a.tez.dag.app.rm.YarnTaskSchedulerService.initialize() L278</code></span><span class="desc">→ amRmClient.init(conf) + 容器复用/locality/超时等配置初始化</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.rm.YarnTaskSchedulerService.start() L361</code></span><span class="desc">→ amRmClient.start() L365 → amRmClient.registerApplicationMaster() L366</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.rm.TezAMRMClientAsync (extends AMRMClientAsyncImpl)</code></span><span class="desc">→ 构造函数L223创建: new AMRMClientImpl + 1000ms心跳间隔 + CallbackHandler=this</span></div>
+  <div class="row"><span class="cls"><code>o.a.tez.dag.app.rm.YarnTaskSchedulerService.getProgress() L901</code></span><span class="desc">→ 第一次心跳时 totalResources = getAvailableResources(), 只赋值一次</span></div>
+  <div class="row"><span class="cls"><code>o.a.tez.dag.app.rm.YarnTaskSchedulerService.getAvailableResources() L256</code></span><span class="desc">→ 返回 amRmClient 缓存的 RM headroom</span></div>
+  <div class="row"><span class="cls"><code>o.a.tez.dag.app.dag.TezRootInputInitializerContextImpl.getTotalAvailableResource() L107</code></span><span class="desc">→ 返回上面固定的 totalResources</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.client.TezClient.preWarm() L921</code></span><span class="desc">→ 构建 PreWarm DAG, 调 submitDAG() 走完全相同路径</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.client.TezClient.submitDAG() L610</code></span><span class="desc">→ isSession ? submitDAGSession() : submitDAGApplication()</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.client.TezClient.submitDAGSession() L647</code></span><span class="desc">→ prepareAndCreateDAGPlan → 构建 SubmitDAGRequestProto → FrameworkClient.submitDag()</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.client.FrameworkClient.submitDag() L111</code></span><span class="desc">→ waitForProxy() → proxy.submitDAG(null, request) [RPC到AM]</span></div>
+  <div class="row"><span class="cls"><code>o.a.tez.dag.api.client.rpc.DAGClientAMProtocolBlockingPBServerImpl.submitDAG() L160</code></span><span class="desc">→ AM端RPC接收, 解析DAGPlan, 大请求从HDFS反序列化</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.api.client.DAGClientHandler.submitDAG() L139</code></span><span class="desc">→ 纯转发: dagAppMaster.submitDAGToAppMaster()</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.DAGAppMaster.submitDAGToAppMaster() L1287</code></span><span class="desc">→ 等前DAG清理 → PreWarm不计数 → startDAG()</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.DAGAppMaster.startDAG() L2463</code></span><span class="desc">→ createDAG(dagPlan) → startDAGExecution()</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.DAGAppMaster.startDAGExecution() L2538</code></span><span class="desc">→ dagEventDispatcher.handle(DAG_INIT)[同步] → sendEvent(DAG_START)[异步]</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.dag.impl.DAGImpl.InitTransition L1849</code></span><span class="desc">→ initializeDAG() → 对每个根Vertex发V_INIT → DAGState.INITED</span></div>
+  <div class="row"><span class="cls"><code>org.apache.hadoop.hive.ql.exec.tez.HiveSplitGenerator.initialize() L186-352</code></span><span class="desc">→ 核心入口: availableSlots计算 → getSplits → generateGroupedSplits → createEventList</span></div>
+  <div class="row"><span class="cls"><code>org.apache.hadoop.hive.ql.io.HiveInputFormat.getSplits() L679</code></span><span class="desc">→ 按分区遍历, addSplitsForGroup() 调实际 InputFormat</span></div>
+  <div class="row"><span class="cls"><code>org.apache.hadoop.hive.ql.io.HiveInputFormat.addSplitsForGroup() L462</code></span><span class="desc">→ 设置输入路径, 调 OrcInputFormat.getSplits(), 包装为 HiveInputSplit</span></div>
+  <div class="row"><span class="cls"><code>org.apache.hadoop.mapred.FileInputFormat.getSplits()</code></span><span class="desc">→ goalSize=totalSize/numSplits, splitSize=max(minSize,min(goalSize,blk))</span></div>
+  <div class="row"><span class="cls"><code>org.apache.hadoop.hive.ql.exec.tez.SplitGrouper.generateGroupedSplits() L154→L164</code></span><span class="desc">→ 6参转8参, schemaEvolved分桶 → group()</span></div>
+  <div class="row"><span class="cls"><code>org.apache.hadoop.hive.ql.exec.tez.SplitGrouper.group() L72</code></span><span class="desc">→ estimateBucketSizes() → tezGrouper.getGroupedSplits()</span></div>
+  <div class="row"><span class="cls"><code>org.apache.hadoop.hive.ql.exec.tez.SplitGrouper.estimateBucketSizes() L203</code></span><span class="desc">→ desiredNumSplits = (int)(availableSlots * waves * bucketSize / totalSize)</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.mapreduce.grouper.TezMapredSplitsGrouper.getGroupedSplits() L224</code></span><span class="desc">→ 边界检查 max/min-size, 不分组判断, 按location多轮迭代分组</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.dag.impl.VertexImpl.setParallelism()</code></span><span class="desc">→ 设置最终 Map 数, 创建 Task</span></div>
+  <div class="row"><span class="cls"><code>org.apache.tez.dag.app.rm.TaskSchedulerManager.allocateTask()</code></span><span class="desc">→ 向 RM 请求 Container</span></div>
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#1f6feb',
+    primaryTextColor: '#c9d1d9',
+    primaryBorderColor: '#388bfd',
+    lineColor: '#8b949e',
+    secondaryColor: '#161b22',
+    tertiaryColor: '#21262d',
+    noteBkgColor: '#1c2128',
+    noteTextColor: '#c9d1d9',
+    noteBorderColor: '#444c56',
+    actorBkg: '#161b22',
+    actorBorder: '#388bfd',
+    actorTextColor: '#c9d1d9',
+    actorLineColor: '#30363d',
+    signalColor: '#8b949e',
+    signalTextColor: '#c9d1d9',
+    activationBkgColor: '#1f6feb22',
+    activationBorderColor: '#388bfd',
+    sequenceNumberColor: '#0d1117',
+  },
+  sequence: {
+    diagramMarginX: 16,
+    diagramMarginY: 16,
+    actorMargin: 60,
+    width: 180,
+    height: 46,
+    boxMargin: 6,
+    boxTextMargin: 5,
+    noteMargin: 10,
+    messageMargin: 35,
+    mirrorActors: true,
+    useMaxWidth: true,
+    showSequenceNumbers: true,
+    wrap: true,
+    wrapPadding: 12,
+  },
+  fontFamily: 'SF Mono, Monaco, Consolas, monospace',
+  fontSize: 12,
+});
+</script>
+
+</body>
+</html>
