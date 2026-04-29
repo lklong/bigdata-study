@@ -1,28 +1,29 @@
 # [教案] Flink on YARN — Hudi 实时数据湖使用姿势
 
-> 🎯 教学目标：掌握 Flink + Hudi 构建实时数据湖，包括 COW/MOR 表类型选择、流式写入(INSERT/UPSERT/DELETE)、增量读取(CDC)、MySQL CDC→Flink→Hudi 端到端、Compaction 与索引配置 | ⏰ 预计学时: 90分钟 | 📊 难度: ⭐⭐⭐⭐
+> 🎯 教学目标：掌握 Flink + Hudi 实时数据湖方案，实现 MySQL CDC 实时入湖、流式增量读取、COW/MOR 表管理 | ⏰ 预计学时: 120分钟 | 📊 难度: ⭐⭐⭐⭐
 
 ---
 
-## 一、课前导入
+## 一、课前导入（什么场景需要用？）
 
-### 1.1 什么场景需要 Flink + Hudi？
+### 1.1 典型业务场景
 
-**生活类比**：传统 Hive 数仓就像一本"只能追加的账本"，你只能往后面加页，想改前面的记录就得重写整本。Hudi 就像一本"支持涂改液的账本"——你可以修改、删除历史记录，同时还能快速找到"最近改了哪些"。
+| 场景 | 描述 | 示例 |
+|------|------|------|
+| **CDC 入湖** | MySQL/PostgreSQL 变更数据实时同步到 Hudi | 业务库订单表实时入湖 |
+| **实时宽表** | 多源数据 Join 后写入 Hudi 宽表 | 订单 + 用户 + 商品 → 宽表 |
+| **增量 ETL** | 流式增量读取 Hudi 表，实现链式 ETL | ODS → DWD → DWS 层级流转 |
+| **数据修正** | 支持 Update/Delete，修正历史错误数据 | 数据回刷、GDPR 删除 |
+| **近实时分析** | 写入即可查，分钟级延迟 | 实时报表、实时指标 |
 
-典型场景：
-- MySQL 业务数据实时同步到数据湖（CDC → Hudi）
-- 需要更新/删除历史数据的 OLAP 场景
-- 近实时数仓：分钟级可见性 + 增量读取
+### 1.2 COW vs MOR 决策表
 
-### 1.2 Hudi 核心概念
-
-| 概念 | 说明 |
-|------|------|
-| COW | 写入时合并，读取无开销 |
-| MOR | 写入快追加log，读取时合并 |
-| Timeline | 记录所有操作的时间戳 |
-| Compaction | MOR 表中 log → base file 合并 |
+| 维度 | COW (Copy on Write) | MOR (Merge on Read) |
+|------|--------------------|--------------------|
+| **写入性能** | 慢（重写整个文件） | 快（写 log 文件） |
+| **读取性能** | 快（直接读 parquet） | 较慢（合并 base + log） |
+| **适用场景** | 读多写少 | 写多读少，实时入湖 |
+| **Compaction** | 写入时完成 | 需要独立配置 |
 
 ---
 
@@ -30,185 +31,180 @@
 
 ### 2.1 环境要求
 
-| 组件 | 版本 | 说明 |
-|------|------|------|
-| Flink | 1.15~1.18 | 对应 Hudi 版本 |
-| Hudi | 0.14+ | 推荐 0.14.1/0.15.0 |
-| Hadoop | 3.x | YARN + HDFS |
+| 组件 | 版本要求 | 说明 |
+|------|---------|------|
+| Flink | 1.17.x / 1.18.x | 推荐 1.17 |
+| Hudi | 0.14.x / 0.15.x | 推荐 0.14+ |
+| Hadoop/YARN | 3.1+ | Flink on YARN |
+| Hive Metastore | 3.1+ | 元数据管理 |
+| MySQL | 5.7+ / 8.0+ | CDC 数据源 |
 
-### 2.2 JAR 依赖
+### 2.2 环境准备命令
 
 ```bash
+export FLINK_HOME=/opt/flink-1.17.2
+export HADOOP_HOME=/opt/hadoop
+export HADOOP_CLASSPATH=$(hadoop classpath)
+
+cd $FLINK_HOME/lib
+
+# Hudi Flink Bundle
 wget https://repo1.maven.org/maven2/org/apache/hudi/hudi-flink1.17-bundle/0.14.1/hudi-flink1.17-bundle-0.14.1.jar
-cp hudi-flink1.17-bundle-0.14.1.jar $FLINK_HOME/lib/
-export HADOOP_CLASSPATH=`hadoop classpath`
+
+# Flink CDC MySQL Connector
+wget https://repo1.maven.org/maven2/com/ververica/flink-sql-connector-mysql-cdc/2.4.2/flink-sql-connector-mysql-cdc-2.4.2.jar
+
+# Kafka Connector
+wget https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/1.17.2/flink-sql-connector-kafka-1.17.2.jar
+
+# 拷贝配置
+cp $HADOOP_HOME/etc/hadoop/core-site.xml $FLINK_HOME/conf/
+cp $HADOOP_HOME/etc/hadoop/hdfs-site.xml $FLINK_HOME/conf/
+cp /opt/hive/conf/hive-site.xml $FLINK_HOME/conf/
+
+hdfs dfs -mkdir -p /warehouse/hudi
 ```
 
 ---
 
 ## 三、核心使用方式
 
-### 3.1 建 Hudi 表 DDL
+### 3.1 Hudi MOR 表 DDL
 
 ```sql
--- COW 表
-CREATE TABLE hudi_orders_cow (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    user_id STRING,
-    amount DECIMAL(10, 2),
-    status STRING,
-    order_time TIMESTAMP(3),
-    dt STRING
-) PARTITIONED BY (dt) WITH (
-    'connector' = 'hudi',
-    'path' = 'hdfs:///data/hudi/orders_cow',
-    'table.type' = 'COPY_ON_WRITE',
-    'hoodie.datasource.write.recordkey.field' = 'order_id',
-    'hoodie.datasource.write.precombine.field' = 'order_time',
-    'write.tasks' = '4',
-    'write.operation' = 'upsert'
-);
-
--- MOR 表
 CREATE TABLE hudi_orders_mor (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    user_id STRING,
-    amount DECIMAL(10, 2),
-    status STRING,
-    order_time TIMESTAMP(3),
-    dt STRING
-) PARTITIONED BY (dt) WITH (
+    order_id    BIGINT,
+    user_id     BIGINT,
+    product_name STRING,
+    amount      DECIMAL(10,2),
+    status      STRING,
+    update_time TIMESTAMP(3),
+    dt          STRING,
+    PRIMARY KEY (order_id) NOT ENFORCED
+) PARTITIONED BY (dt)
+WITH (
     'connector' = 'hudi',
-    'path' = 'hdfs:///data/hudi/orders_mor',
+    'path' = 'hdfs:///warehouse/hudi/orders_mor',
     'table.type' = 'MERGE_ON_READ',
     'hoodie.datasource.write.recordkey.field' = 'order_id',
-    'hoodie.datasource.write.precombine.field' = 'order_time',
+    'hoodie.datasource.write.precombine.field' = 'update_time',
+    'hoodie.table.name' = 'orders_mor',
     'write.tasks' = '4',
-    'write.operation' = 'upsert',
     'compaction.async.enabled' = 'true',
-    'compaction.delta_commits' = '5'
+    'compaction.trigger.strategy' = 'num_commits',
+    'compaction.delta_commits' = '5',
+    'compaction.tasks' = '4',
+    'hive_sync.enable' = 'true',
+    'hive_sync.db' = 'ods',
+    'hive_sync.table' = 'ods_orders',
+    'hive_sync.mode' = 'hms',
+    'hive_sync.metastore.uris' = 'thrift://hive-metastore:9083'
 );
 ```
 
-### 3.2 COW vs MOR 选择
+### 3.2 参数详解表
 
-| 维度 | COW | MOR |
-|------|-----|-----|
-| 写入延迟 | 高 | 低 |
-| 读取延迟 | 低 | 中 |
-| 适用场景 | 读多写少 | CDC入湖 |
+| 参数 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `connector` | ✅ | - | 固定 `hudi` |
+| `path` | ✅ | - | HDFS 存储路径 |
+| `table.type` | ❌ | `COPY_ON_WRITE` | COW / MOR |
+| `hoodie.datasource.write.recordkey.field` | ✅ | - | 主键字段 |
+| `hoodie.datasource.write.precombine.field` | ✅ | - | 预合并字段 |
+| `write.tasks` | ❌ | `4` | 写入并行度 |
+| `write.operation` | ❌ | `upsert` | upsert / insert / bulk_insert |
+| `compaction.async.enabled` | ❌ | `true` | 异步 Compaction |
+| `compaction.delta_commits` | ❌ | `5` | 触发 Compaction 的 commit 数 |
+| `hive_sync.enable` | ❌ | `false` | 是否同步 Hive |
 
 ---
 
 ## 四、完整实战示例
 
-### 4.1 MySQL CDC → Hudi
+### 4.1 MySQL CDC → Flink → Hudi
 
 ```sql
+-- MySQL CDC Source
 CREATE TABLE mysql_orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    user_id VARCHAR(64),
-    amount DECIMAL(10, 2),
-    status VARCHAR(32),
-    create_time TIMESTAMP(3),
-    update_time TIMESTAMP(3)
+    order_id BIGINT, user_id BIGINT, product_name STRING,
+    amount DECIMAL(10,2), status STRING,
+    create_time TIMESTAMP(3), update_time TIMESTAMP(3),
+    PRIMARY KEY (order_id) NOT ENFORCED
 ) WITH (
     'connector' = 'mysql-cdc',
-    'hostname' = 'mysql-host',
-    'port' = '3306',
-    'username' = 'flink_cdc',
-    'password' = 'your_password',
-    'database-name' = 'ecommerce',
-    'table-name' = 'orders',
-    'server-time-zone' = 'Asia/Shanghai'
+    'hostname' = 'mysql-host', 'port' = '3306',
+    'username' = 'flink_cdc', 'password' = 'Flink@CDC2026',
+    'database-name' = 'demo', 'table-name' = 'orders',
+    'scan.startup.mode' = 'initial'
 );
 
-CREATE TABLE hudi_orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    user_id STRING,
-    amount DECIMAL(10, 2),
-    status STRING,
-    create_time TIMESTAMP(3),
-    update_time TIMESTAMP(3),
-    dt STRING
-) PARTITIONED BY (dt) WITH (
-    'connector' = 'hudi',
-    'path' = 'hdfs:///data/hudi/ods_orders',
-    'table.type' = 'MERGE_ON_READ',
-    'hoodie.datasource.write.recordkey.field' = 'order_id',
-    'hoodie.datasource.write.precombine.field' = 'update_time',
-    'write.operation' = 'upsert',
-    'write.tasks' = '4',
-    'index.type' = 'BUCKET',
-    'hoodie.bucket.index.num.buckets' = '8',
-    'compaction.async.enabled' = 'true',
-    'compaction.delta_commits' = '5',
-    'hive_sync.enabled' = 'true',
-    'hive_sync.db' = 'ods',
-    'hive_sync.table' = 'orders',
-    'hive_sync.mode' = 'hms',
-    'hive_sync.metastore.uris' = 'thrift://hive-metastore:9083'
-);
-
-INSERT INTO hudi_orders
-SELECT order_id, user_id, amount, status, create_time, update_time,
-       DATE_FORMAT(create_time, 'yyyy-MM-dd') AS dt
+-- 写入 Hudi
+INSERT INTO hudi_orders_mor
+SELECT order_id, user_id, product_name, amount, status,
+       update_time, DATE_FORMAT(update_time, 'yyyy-MM-dd') AS dt
 FROM mysql_orders;
 ```
 
-### 4.2 增量读取（CDC 模式）
+### 4.2 流式增量读取
 
 ```sql
-CREATE TABLE hudi_orders_cdc (...) WITH (
+CREATE TABLE hudi_cdc_source (...) WITH (
     'connector' = 'hudi',
-    'path' = 'hdfs:///data/hudi/ods_orders',
-    'table.type' = 'MERGE_ON_READ',
+    'path' = 'hdfs:///warehouse/hudi/ods_orders',
     'read.streaming.enabled' = 'true',
-    'read.start-commit' = '20240115120000',
-    'read.streaming.check-interval' = '10',
+    'read.streaming.check-interval' = '30',
     'changelog.enabled' = 'true'
 );
 ```
 
-### 4.3 提交命令
+### 4.3 Application Mode 提交
 
 ```bash
-flink run-application -t yarn-application \
-    -Dyarn.application.name="mysql-cdc-to-hudi" \
-    -Djobmanager.memory.process.size=4096m \
-    -Dtaskmanager.memory.process.size=8192m \
-    -Dtaskmanager.numberOfTaskSlots=4 \
-    -Dexecution.checkpointing.interval=60000 \
-    -Dstate.backend=rocksdb \
-    -Dstate.checkpoints.dir=hdfs:///flink/checkpoints/mysql-cdc-hudi \
-    -c com.example.MySQLCDCToHudi \
-    hdfs:///flink/jars/mysql-cdc-to-hudi.jar
+$FLINK_HOME/bin/flink run-application -t yarn-application \
+  -Djobmanager.memory.process.size=2048m \
+  -Dtaskmanager.memory.process.size=4096m \
+  -Dparallelism.default=4 \
+  -Dyarn.application.name="MySQL-CDC-to-Hudi" \
+  -Dexecution.checkpointing.interval=60000 \
+  -Dstate.backend=rocksdb \
+  -Dstate.checkpoints.dir=hdfs:///flink/checkpoints/cdc-hudi \
+  -c com.example.MysqlCdcToHudiJob \
+  /path/to/flink-hudi-job.jar
 ```
 
 ---
 
 ## 五、常见问题与排障
 
-| # | 现象 | 原因 | 解决方案 |
-|---|------|------|----------|
-| 1 | `NoSuchMethodError` | Bundle JAR 与 Flink 版本不匹配 | 使用对应版本 |
-| 2 | 写入延迟递增 | log files 未 compact | 检查 Compaction |
-| 3 | State 持续膨胀 | FLINK_STATE 索引 | 换 BUCKET 索引 |
-| 4 | CP 超时 | State 太大 | 增量 CP + 增大超时 |
-| 5 | Hive 查询为空 | Hive Sync 失败 | 检查 hive_sync 配置 |
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| `ConcurrentModificationException` | 多 Writer | 一张表只能一个 Writer |
+| Compaction 卡住 | TM 内存不足 | 增大内存 / compaction.tasks |
+| Hive 查不到数据 | 同步未开启 | `hive_sync.enable=true` |
+| recordkey null | 数据质量 | 过滤 null 主键 |
 
 ---
 
 ## 六、生产最佳实践
 
-### 6.1 资源配置
+### 6.1 Compaction 调优
 
+```sql
+'compaction.trigger.strategy' = 'num_and_time',
+'compaction.delta_commits' = '5',
+'compaction.delta_seconds' = '300',
+'compaction.tasks' = '8',
+'clean.async.enabled' = 'true',
+'hoodie.cleaner.commits.retained' = '10'
 ```
-write.tasks = Source并行度 / 2~4
-num.buckets = 数据量(条) / 500000
-TM Memory = 4GB + State开销
-CP Interval = 60~120s
-```
+
+### 6.2 资源配置
+
+| 场景 | TM 内存 | write.tasks | compaction.tasks |
+|------|---------|-------------|-----------------|
+| 小表 | 4G | 2 | 2 |
+| 中表 | 8G | 4 | 4 |
+| 大表 | 16G | 8 | 8 |
 
 ---
 
@@ -216,15 +212,15 @@ CP Interval = 60~120s
 
 ### 7.1 面试高频题
 
-**Q1: COW vs MOR 本质区别？**
-> COW写时合并base file（写重读轻），MOR写时追加log（写轻读重需合并）。
+**Q: COW vs MOR 如何选择？**
+> 读多写少选 COW，写多读少（如 CDC 实时入湖）选 MOR。
 
-**Q2: FLINK_STATE vs BUCKET 索引？**
-> STATE精确但State大，BUCKET无State但需预规划桶数。
+**Q: precombine field 的作用？**
+> 同一 Rowkey 多条记录时，取 precombine field 最大值保留。通常用 update_time。
 
-**Q3: Compaction 不执行的后果？**
-> log files 累积→读取变慢→HDFS小文件激增。
+**Q: Hudi 表能多 Writer 吗？**
+> 不能。Timeline 加锁机制保证同一时刻只有一个 Writer。
 
 ---
 
-**本教案结束。**
+> 📝 **教案小结**：Flink + Hudi 最适合 CDC 入湖场景。核心：COW/MOR 按读写比选择，precombine field 决定版本，Compaction 是 MOR 的生命线。
