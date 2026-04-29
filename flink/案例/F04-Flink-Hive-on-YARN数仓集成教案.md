@@ -1,20 +1,20 @@
 # [教案] Flink on YARN — Hive 数仓集成使用姿势
 
-> 🎯 教学目标：掌握 Flink 与 Hive 数仓的深度集成，包括 HiveCatalog 配置、读写 Hive 表、流式分区写入、维表 Join 等 | ⏰ 预计学时: 100分钟 | 📊 难度: ⭐⭐⭐⭐
+> 🎯 教学目标：掌握 Flink 与 Hive 的集成使用方法，包括 HiveCatalog 配置、读写 Hive 表、流式写入分区、Lookup Join 维表关联 | ⏰ 预计学时: 90分钟 | 📊 难度: ⭐⭐⭐⭐
 
 ---
 
 ## 一、课前导入（什么场景需要用？）
 
-**生活类比**：想象你有一个巨大的仓库（Hive 数仓），里面存放着各种历史货物清单（离线数据）。现在你要做两件事：
-1. **实时补货**：把实时到货的商品（流数据）不断地分类入库到正确的货架上（流式写入 Hive 分区）
-2. **实时查价**：正在分拣的包裹需要实时查询价格表（Hive 维表 Join）来贴价签
+Hive 是大数据生态中的数仓核心，几乎所有公司的离线数仓都建在 Hive 上。Flink 与 Hive 集成后可以实现：
 
-**生产场景**：
-- 实时数仓：流式数据实时写入 Hive ODS/DWD 层分区表
-- 离线数据补充：Flink 流处理中关联 Hive 维表（用户画像、商品属性）
-- 批流一体：同一套 SQL 既能跑批（读 Hive 历史数据）又能跑流（监听新分区）
-- Hive UDF 复用：在 Flink SQL 中直接使用已有的 Hive UDF
+| 场景 | 架构 |
+|------|------|
+| 实时入湖 | Kafka → Flink → Hive 表（流式写入分区） |
+| 批流一体 | 同一套 SQL 既能跑批（读 Hive）又能跑流（读 Kafka） |
+| 维表关联 | 实时流 JOIN Hive 维表（Lookup Join） |
+| 数仓加速 | 用 Flink 替代 Hive MR/Tez 做批处理 |
+| 元数据复用 | 通过 HiveCatalog 共享 Hive Metastore 元数据 |
 
 ---
 
@@ -24,141 +24,308 @@
 
 | 组件 | 版本要求 | 说明 |
 |------|----------|------|
-| Flink | 1.17.x / 1.18.x | 本教案以 1.17.2 为例 |
-| Hive | 2.3.x / 3.1.x | 本教案以 3.1.3 为例 |
-| Hadoop/YARN | 3.x | 本教案以 3.3.6 为例 |
-| Hive Metastore | 需独立运行 | Thrift 服务模式 |
-| Java | JDK 8 / JDK 11 | |
+| Flink | 1.17+ / 1.18 | - |
+| Hive | 2.3.x / 3.1.x | 推荐 Hive 3.1 |
+| Hadoop/YARN | 2.8+ / 3.x | HDFS + YARN |
+| Hive Metastore | 独立运行 | 端口 9083 |
+| Java | JDK 8 / JDK 11 | - |
 
-### 2.2 所需 JAR 包
+### 2.2 需要的 JAR 包
 
 ```bash
-# Flink Hive Connector（必须）
-flink-sql-connector-hive-3.1.3_2.12-1.17.2.jar
+# ============================================================
+# Hive Connector（必须！uber jar）
+# ============================================================
+# Hive 3.1.x 版本
+wget https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-hive-3.1.3_2.12/1.18.1/flink-sql-connector-hive-3.1.3_2.12-1.18.1.jar \
+  -P $FLINK_HOME/lib/
 
-# Hadoop 依赖（如果 Flink 发行版不含）
-flink-shaded-hadoop-3-uber-3.3.6-1.17.2.jar
+# Hive 2.3.x 版本
+# wget https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-hive-2.3.10_2.12/1.18.1/flink-sql-connector-hive-2.3.10_2.12-1.18.1.jar \
+#   -P $FLINK_HOME/lib/
 
-# Hive 相关 JAR（从 Hive 安装目录复制）
-hive-exec-3.1.3.jar
-hive-metastore-3.1.3.jar
-libfb303-0.9.3.jar
+# ============================================================
+# 其他格式支持（按需）
+# ============================================================
+# Parquet
+cp $FLINK_HOME/opt/flink-sql-parquet-*.jar $FLINK_HOME/lib/
+# ORC
+cp $FLINK_HOME/opt/flink-sql-orc-*.jar $FLINK_HOME/lib/
 ```
 
-### 2.3 环境准备命令
+### 2.3 环境准备
 
 ```bash
-# 1. 确认 Hive Metastore 已启动
-hive --service metastore &
-netstat -tlnp | grep 9083
+# 环境变量
+export FLINK_HOME=/opt/flink-1.18.1
+export HADOOP_HOME=/opt/hadoop
+export HADOOP_CONF_DIR=$HADOOP_HOME/etc/hadoop
+export HADOOP_CLASSPATH=$(hadoop classpath)
+export HIVE_HOME=/opt/hive
+export HIVE_CONF_DIR=$HIVE_HOME/conf
 
-# 2. 确认 hive-site.xml 配置
-cat $HIVE_HOME/conf/hive-site.xml | grep -A1 "hive.metastore.uris"
-
-# 3. 复制 hive-site.xml 到 Flink conf 目录
+# 将 hive-site.xml 放入 Flink conf 目录（关键！）
 cp $HIVE_HOME/conf/hive-site.xml $FLINK_HOME/conf/
 
-# 4. 下载 Flink-Hive Connector
-cd $FLINK_HOME/lib/
-wget https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-hive-3.1.3_2.12/1.17.2/flink-sql-connector-hive-3.1.3_2.12-1.17.2.jar
+# 验证 Hive Metastore 是否运行
+netstat -nltp | grep 9083
+# 或
+hive --service metastore --help
 
-# 5. 设置 HADOOP_CLASSPATH（关键！）
-export HADOOP_CLASSPATH=`hadoop classpath`
+# 验证 Hive 连通性
+beeline -u "jdbc:hive2://hiveserver2-host:10000" -e "SHOW DATABASES;"
+```
 
-# 6. 在 Hive 中创建测试表
-hive -e "
-CREATE DATABASE IF NOT EXISTS flink_test;
-USE flink_test;
-CREATE TABLE IF NOT EXISTS dim_user (
-    user_id STRING, user_name STRING, age INT, city STRING
-) STORED AS ORC;
-INSERT INTO dim_user VALUES ('10001','张三',28,'北京'),('10002','李四',32,'上海'),('10003','王五',25,'广州');
-"
+### 2.4 hive-site.xml 关键配置
+
+```xml
+<!-- $FLINK_HOME/conf/hive-site.xml -->
+<configuration>
+    <property>
+        <name>hive.metastore.uris</name>
+        <value>thrift://metastore-host:9083</value>
+    </property>
+    <property>
+        <name>hive.metastore.warehouse.dir</name>
+        <value>/user/hive/warehouse</value>
+    </property>
+</configuration>
 ```
 
 ---
 
 ## 三、核心使用方式
 
-### 3.1 HiveCatalog 配置
+### 3.1 HiveCatalog 配置与使用
 
 ```sql
+-- ============================================================
+-- 创建 HiveCatalog
+-- ============================================================
 CREATE CATALOG hive_catalog WITH (
     'type' = 'hive',
-    'default-database' = 'flink_test',
-    'hive-conf-dir' = '/opt/hive-3.1.3/conf'
+    'default-database' = 'default',
+    'hive-conf-dir' = '/opt/hive/conf'
+    -- 'hadoop-conf-dir' = '/opt/hadoop/etc/hadoop'  -- 可选
 );
+
+-- 使用 HiveCatalog
 USE CATALOG hive_catalog;
-USE flink_test;
+SHOW DATABASES;
+USE my_database;
 SHOW TABLES;
+
+-- 查看表结构
+DESCRIBE my_hive_table;
+SHOW CREATE TABLE my_hive_table;
 ```
 
 ### 3.2 读取 Hive 表
 
-#### 批模式
+#### 批模式读取（标准方式）
 
 ```sql
+-- ============================================================
+-- 批模式读取 Hive 表
+-- ============================================================
 SET 'execution.runtime-mode' = 'batch';
-SELECT * FROM dim_user WHERE city = '北京';
+
+-- 直接查询 Hive 表
+SELECT * FROM hive_catalog.my_db.user_info WHERE dt = '2024-01-15' LIMIT 10;
+
+-- 聚合查询
+SELECT
+    dt,
+    COUNT(*) AS user_count,
+    SUM(amount) AS total_amount
+FROM hive_catalog.my_db.order_fact
+WHERE dt BETWEEN '2024-01-01' AND '2024-01-31'
+GROUP BY dt
+ORDER BY dt;
 ```
 
-#### 流式监控新分区
+#### 流模式读取 Hive 分区（Streaming Read）
 
 ```sql
+-- ============================================================
+-- 流式读取 Hive 分区表（监听新分区到达）
+-- ============================================================
 SET 'execution.runtime-mode' = 'streaming';
-SELECT * FROM ods_order /*+ OPTIONS(
+
+-- Hive 分区表需要配置 streaming-source 参数
+CREATE TABLE IF NOT EXISTS hive_catalog.my_db.streaming_orders (
+    order_id    BIGINT,
+    user_id     BIGINT,
+    amount      DECIMAL(10,2),
+    order_time  STRING
+) PARTITIONED BY (dt STRING, hr STRING)
+TBLPROPERTIES (
     'streaming-source.enable' = 'true',
-    'streaming-source.monitor-interval' = '60s'
+    'streaming-source.monitor-interval' = '1min',
+    'streaming-source.partition-order' = 'partition-name',
+    'streaming-source.consume-start-offset' = '2024-01-15'
+);
+
+-- 或者用 Table Hints 临时开启流式读取
+SELECT * FROM hive_catalog.my_db.order_fact
+/*+ OPTIONS(
+    'streaming-source.enable' = 'true',
+    'streaming-source.monitor-interval' = '60s',
+    'streaming-source.partition-order' = 'partition-name'
 ) */;
 ```
 
-### 3.3 流式写入 Hive 分区表
+**流式读取参数详解**：
+
+| 参数 | 含义 | 推荐值 | 注意事项 |
+|------|------|--------|----------|
+| `streaming-source.enable` | 开启流式读取 | true | - |
+| `streaming-source.monitor-interval` | 新分区检测间隔 | 1min-5min | 越短发现越快，开销越大 |
+| `streaming-source.partition-order` | 分区排序方式 | partition-name | 按分区名字典序 |
+| `streaming-source.consume-start-offset` | 起始分区 | 具体分区值 | 避免读取全部历史分区 |
+
+### 3.3 写入 Hive 表（流式写入）
 
 ```sql
-CREATE TABLE hive_sink_table (
-    order_id STRING, user_id STRING, amount DOUBLE, order_time TIMESTAMP(3)
-) PARTITIONED BY (dt STRING, hr STRING) WITH (
-    'connector' = 'hive',
+-- ============================================================
+-- 流式写入 Hive 分区表
+-- ============================================================
+
+-- 1. 在 Hive Catalog 下建表
+USE CATALOG hive_catalog;
+USE my_db;
+
+CREATE TABLE IF NOT EXISTS dwd_events (
+    event_id    STRING,
+    user_id     BIGINT,
+    event_type  STRING,
+    page_url    STRING,
+    event_time  TIMESTAMP(3)
+) PARTITIONED BY (dt STRING, hr STRING)
+STORED AS PARQUET
+TBLPROPERTIES (
     'sink.partition-commit.trigger' = 'partition-time',
-    'sink.partition-commit.delay' = '1h',
+    'sink.partition-commit.delay' = '5 min',
+    'sink.partition-commit.watermark-time-zone' = 'Asia/Shanghai',
     'sink.partition-commit.policy.kind' = 'metastore,success-file',
-    'partition.time-extractor.timestamp-pattern' = '$dt $hr:00:00',
     'sink.rolling-policy.file-size' = '128MB',
+    'sink.rolling-policy.rollover-interval' = '15 min',
+    'sink.rolling-policy.check-interval' = '1 min',
     'auto-compaction' = 'true',
-    'compaction.file-size' = '128MB'
+    'compaction.file-size' = '256MB'
 );
+
+-- 2. 切换到 default_catalog 创建 Kafka Source
+USE CATALOG default_catalog;
+
+CREATE TABLE kafka_events (
+    event_id    STRING,
+    user_id     BIGINT,
+    event_type  STRING,
+    page_url    STRING,
+    event_time  TIMESTAMP(3),
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'user_events',
+    'properties.bootstrap.servers' = 'kafka01:9092,kafka02:9092',
+    'properties.group.id' = 'flink-hive-writer',
+    'scan.startup.mode' = 'latest-offset',
+    'format' = 'json',
+    'json.ignore-parse-errors' = 'true'
+);
+
+-- 3. 流式写入 Hive
+INSERT INTO hive_catalog.my_db.dwd_events
+SELECT
+    event_id,
+    user_id,
+    event_type,
+    page_url,
+    event_time,
+    DATE_FORMAT(event_time, 'yyyy-MM-dd') AS dt,
+    DATE_FORMAT(event_time, 'HH') AS hr
+FROM kafka_events;
 ```
 
-| 参数 | 说明 | 可选值 |
-|------|------|--------|
-| `sink.partition-commit.trigger` | 提交触发条件 | `process-time` / `partition-time` |
-| `sink.partition-commit.delay` | 触发延迟 | `1h`、`30min` |
-| `sink.partition-commit.policy.kind` | 提交策略 | `metastore` / `success-file` / 组合 |
-| `partition.time-extractor.timestamp-pattern` | 分区时间提取 | `$dt $hr:00:00` |
-| `sink.rolling-policy.file-size` | 文件滚动大小 | 推荐 `128MB` |
-| `auto-compaction` | 自动合并小文件 | `true` / `false` |
+**分区提交参数详解**：
+
+| 参数 | 含义 | 推荐值 | 注意事项 |
+|------|------|--------|----------|
+| `sink.partition-commit.trigger` | 提交触发器 | partition-time | 基于 Watermark 判断分区完成 |
+| `sink.partition-commit.delay` | 提交延迟 | 5min | 等待迟到数据 |
+| `sink.partition-commit.policy.kind` | 提交策略 | metastore,success-file | 通知 Metastore + 写 _SUCCESS |
+| `sink.rolling-policy.file-size` | 文件滚动大小 | 128MB | 避免小文件 |
+| `sink.rolling-policy.rollover-interval` | 文件滚动间隔 | 15min | 控制文件关闭频率 |
+| `auto-compaction` | 自动合并小文件 | true | Flink 1.15+ 支持 |
+| `compaction.file-size` | 合并目标大小 | 256MB | 合并后的文件大小 |
 
 ### 3.4 Hive 维表 Lookup Join
 
 ```sql
-SELECT o.order_id, o.amount, u.user_name, u.city
-FROM kafka_orders AS o
-LEFT JOIN hive_catalog.flink_test.dim_user /*+ OPTIONS(
-    'lookup.join.cache.ttl' = '1h',
+-- ============================================================
+-- Lookup Join: 实时流关联 Hive 维表
+-- ============================================================
+
+-- Hive 维表（需要配置 lookup 参数）
+-- 假设 hive_catalog.my_db.dim_user 已存在
+
+-- 方式1: Table Hints 指定 Lookup 参数
+SELECT
+    e.event_id,
+    e.user_id,
+    u.user_name,
+    u.city,
+    e.event_type,
+    e.event_time
+FROM kafka_events AS e
+JOIN hive_catalog.my_db.dim_user
+/*+ OPTIONS(
     'streaming-source.enable' = 'true',
-    'streaming-source.monitor-interval' = '5min'
-) */ FOR SYSTEM_TIME AS OF o.proc_time AS u
-ON o.user_id = u.user_id;
+    'streaming-source.partition.include' = 'latest',
+    'streaming-source.monitor-interval' = '1h',
+    'lookup.join.cache.ttl' = '12h'
+) */ FOR SYSTEM_TIME AS OF e.event_time AS u
+ON e.user_id = u.user_id;
+
+-- 方式2: 在建表时指定 TBLPROPERTIES
+-- ALTER TABLE dim_user SET TBLPROPERTIES (
+--     'streaming-source.enable' = 'true',
+--     'streaming-source.partition.include' = 'latest',
+--     'streaming-source.monitor-interval' = '1h',
+--     'lookup.join.cache.ttl' = '12h'
+-- );
 ```
 
-### 3.5 Hive UDF 使用
+**Lookup Join 参数详解**：
+
+| 参数 | 含义 | 推荐值 | 说明 |
+|------|------|--------|------|
+| `streaming-source.partition.include` | 加载分区范围 | latest | 只加载最新分区 |
+| `streaming-source.monitor-interval` | 刷新间隔 | 1h | 维表更新频率 |
+| `lookup.join.cache.ttl` | 缓存过期时间 | 12h | 过期后重新加载 |
+
+### 3.5 Hive UDF 在 Flink 中使用
 
 ```sql
+-- ============================================================
+-- 使用 Hive 已注册的 UDF
+-- ============================================================
 USE CATALOG hive_catalog;
--- 已注册的 Hive UDF 可直接使用
-SELECT my_hive_udf(column1) FROM my_table;
--- 手动注册
-CREATE FUNCTION my_udf AS 'com.example.hive.udf.MyUDF' USING JAR 'hdfs:///udfs/my-udf.jar';
+
+-- Hive 内置函数可直接使用
+SELECT
+    user_id,
+    regexp_extract(url, '.*/(.*)', 1) AS page_name,
+    from_unixtime(ts, 'yyyy-MM-dd HH:mm:ss') AS event_time
+FROM my_table;
+
+-- 自定义 UDF（需要 UDF JAR 在 classpath 中）
+-- 如果 Hive 中已注册，通过 HiveCatalog 可以直接调用
+CREATE FUNCTION my_udf AS 'com.example.MyUDF'
+USING JAR 'hdfs:///udf/my-udf.jar';
+
+SELECT my_udf(column1) FROM my_table;
 ```
 
 ---
@@ -167,58 +334,117 @@ CREATE FUNCTION my_udf AS 'com.example.hive.udf.MyUDF' USING JAR 'hdfs:///udfs/m
 
 ### 4.1 场景描述
 
-Kafka 实时订单流 → 关联 Hive 用户维表 → 写入 Hive 分区表，供下游离线报表查询。
+完整的实时入 Hive 数仓链路：
+- Source: Kafka `user_orders` Topic
+- 处理: 数据清洗 + 维表关联（Hive dim_product）
+- Sink: Hive DWD 层分区表
 
-### 4.2 完整 SQL
+### 4.2 完整 SQL 脚本
+
+创建 `/opt/flink/scripts/hive-etl.sql`：
 
 ```sql
-CREATE CATALOG hive_catalog WITH ('type'='hive','default-database'='flink_test','hive-conf-dir'='/opt/hive-3.1.3/conf');
+-- ============================================================
+-- hive-etl.sql — Kafka 实时入 Hive 数仓
+-- ============================================================
 
-CREATE TABLE kafka_orders (
-    order_id STRING, user_id STRING, amount DOUBLE,
-    order_time TIMESTAMP(3),
-    WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND,
-    proc_time AS PROCTIME()
-) WITH (
-    'connector'='kafka','topic'='orders_topic',
-    'properties.bootstrap.servers'='kafka01:9092,kafka02:9092,kafka03:9092',
-    'properties.group.id'='flink-hive-integration',
-    'scan.startup.mode'='latest-offset','format'='json','json.ignore-parse-errors'='true'
+-- 基础配置
+SET 'execution.runtime-mode' = 'streaming';
+SET 'parallelism.default' = '8';
+SET 'table.local-time-zone' = 'Asia/Shanghai';
+
+-- Checkpoint（写 Hive 必须开启！）
+SET 'execution.checkpointing.interval' = '120s';
+SET 'execution.checkpointing.mode' = 'EXACTLY_ONCE';
+SET 'state.backend' = 'rocksdb';
+SET 'state.checkpoints.dir' = 'hdfs:///flink/checkpoints/hive-etl';
+
+-- 注册 HiveCatalog
+CREATE CATALOG hive_catalog WITH (
+    'type' = 'hive',
+    'default-database' = 'dwd',
+    'hive-conf-dir' = '/opt/hive/conf'
 );
 
-INSERT INTO hive_catalog.flink_test.dwd_order_detail
-SELECT o.order_id, o.user_id, u.user_name, u.city, o.amount, o.order_time,
-    DATE_FORMAT(o.order_time,'yyyy-MM-dd') AS dt, DATE_FORMAT(o.order_time,'HH') AS hr
+-- Kafka Source（default catalog）
+CREATE TABLE kafka_orders (
+    order_id    BIGINT,
+    user_id     BIGINT,
+    product_id  BIGINT,
+    amount      DECIMAL(10, 2),
+    order_time  TIMESTAMP(3),
+    WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'user_orders',
+    'properties.bootstrap.servers' = 'kafka01:9092,kafka02:9092,kafka03:9092',
+    'properties.group.id' = 'flink-hive-etl',
+    'scan.startup.mode' = 'latest-offset',
+    'format' = 'json',
+    'json.ignore-parse-errors' = 'true'
+);
+
+-- 确保 Hive Sink 表存在
+-- (通常在 Hive 中预先建好，这里用 IF NOT EXISTS)
+
+-- 写入 Hive DWD 层
+INSERT INTO hive_catalog.dwd.dwd_order_detail
+SELECT
+    o.order_id,
+    o.user_id,
+    o.product_id,
+    o.amount,
+    o.order_time,
+    DATE_FORMAT(o.order_time, 'yyyy-MM-dd') AS dt,
+    DATE_FORMAT(o.order_time, 'HH') AS hr
 FROM kafka_orders AS o
-LEFT JOIN hive_catalog.flink_test.dim_user FOR SYSTEM_TIME AS OF o.proc_time AS u
-ON o.user_id = u.user_id;
+WHERE o.order_id IS NOT NULL
+  AND o.amount > 0;
 ```
 
-### 4.3 提交命令（Application Mode on YARN）
+### 4.3 Application Mode 提交命令
 
 ```bash
-export HADOOP_CLASSPATH=`hadoop classpath`
+# ============================================================
+# Application Mode 提交 Hive ETL 作业
+# ============================================================
+$FLINK_HOME/bin/sql-client.sh \
+  -Dexecution.target=yarn-application \
+  -Dyarn.application.name="realtime-hive-etl" \
+  -Dyarn.application.queue=production \
+  -Djobmanager.memory.process.size=4096m \
+  -Dtaskmanager.memory.process.size=8192m \
+  -Dtaskmanager.numberOfTaskSlots=4 \
+  -Dyarn.ship-files="/opt/hive/conf/hive-site.xml" \
+  -f /opt/flink/scripts/hive-etl.sql
+
+# 或者用 flink run-application（DataStream API 打的 JAR）
 $FLINK_HOME/bin/flink run-application \
-    -t yarn-application \
-    -Djobmanager.memory.process.size=2048m \
-    -Dtaskmanager.memory.process.size=4096m \
-    -Dtaskmanager.numberOfTaskSlots=2 \
-    -Dparallelism.default=4 \
-    -Dyarn.application.name="Flink-Hive-Integration" \
-    -Dyarn.application.queue=flink \
-    -Dyarn.ship-files="/opt/hive-3.1.3/conf/hive-site.xml" \
-    -Dclassloader.resolve-order=parent-first \
-    -c com.example.flink.hive.HiveIntegrationJob \
-    /opt/flink-jobs/hive-integration-1.0.jar
+  -t yarn-application \
+  -d \
+  -Dyarn.application.name="hive-etl-datastream" \
+  -Djobmanager.memory.process.size=4096m \
+  -Dtaskmanager.memory.process.size=8192m \
+  -Dtaskmanager.numberOfTaskSlots=4 \
+  -Dparallelism.default=8 \
+  -c com.example.flink.HiveETLJob \
+  hdfs:///flink/jars/hive-etl-job.jar
 ```
 
 ### 4.4 验证结果
 
 ```bash
-# Hive 中查询
-hive -e "SHOW PARTITIONS flink_test.dwd_order_detail; SELECT * FROM flink_test.dwd_order_detail WHERE dt='2025-04-20';"
-# HDFS 检查
-hdfs dfs -ls /user/hive/warehouse/flink_test.db/dwd_order_detail/dt=2025-04-20/
+# 在 Hive 中验证数据
+beeline -u "jdbc:hive2://hiveserver2:10000" -e "
+SELECT COUNT(*) FROM dwd.dwd_order_detail WHERE dt = '2024-01-15';
+SHOW PARTITIONS dwd.dwd_order_detail;
+"
+
+# 检查 HDFS 上的文件
+hdfs dfs -ls /user/hive/warehouse/dwd.db/dwd_order_detail/dt=2024-01-15/hr=10/
+
+# 检查 _SUCCESS 文件（分区提交成功标志）
+hdfs dfs -ls /user/hive/warehouse/dwd.db/dwd_order_detail/dt=2024-01-15/hr=09/_SUCCESS
 ```
 
 ---
@@ -227,12 +453,14 @@ hdfs dfs -ls /user/hive/warehouse/flink_test.db/dwd_order_detail/dt=2025-04-20/
 
 | 问题现象 | 原因 | 解决方案 |
 |----------|------|----------|
-| `NoClassDefFoundError: HiveConf` | Hive 依赖未加载 | 设置 `HADOOP_CLASSPATH` |
-| `MetaException: Could not connect` | Metastore 不可达 | 确认 Metastore 已启动 |
-| 分区写入但 Hive 查不到 | 分区未提交 | 检查 `partition-commit.policy.kind` 含 `metastore` |
-| 大量小文件 | 并行度高/ckp 频繁 | 开启 `auto-compaction` |
-| Lookup Join 结果为 null | 类型不匹配/无数据 | 检查 Join key 类型一致 |
-| `TableNotExistException` | Catalog 路径错误 | 使用全限定名 |
+| `NoSuchObjectException: database not found` | HiveCatalog 连接 Metastore 失败 | 检查 `hive-site.xml` 和 Metastore 服务 |
+| 写入 Hive 后查询为空 | 分区未提交到 Metastore | 检查 `sink.partition-commit.policy.kind` 包含 `metastore` |
+| 小文件过多 | rolling-policy 配置过小或 CP 太频繁 | 增大 `sink.rolling-policy.file-size`，开启 `auto-compaction` |
+| `ClassNotFoundException: OrcSerde` | 缺少 ORC 相关 JAR | 添加 `flink-sql-orc-*.jar` 到 lib |
+| Lookup Join 数据不一致 | 维表缓存过期 | 调小 `lookup.join.cache.ttl` 或 `streaming-source.monitor-interval` |
+| Hive 表 Schema 变更后 Flink 不识别 | Catalog 缓存 | 重启作业或使用 `ALTER TABLE ... SET TBLPROPERTIES` |
+| `Permission denied` 写入 HDFS | 用户权限不足 | 检查 HDFS 目录权限，确保 Flink 用户有写权限 |
+| Checkpoint 很慢 | 写入大量小文件 | 增大 rolling-policy 参数，减少文件数 |
 
 ---
 
@@ -240,54 +468,78 @@ hdfs dfs -ls /user/hive/warehouse/flink_test.db/dwd_order_detail/dt=2025-04-20/
 
 ### 6.1 资源配置建议
 
-| 场景 | JM | TM | 并行度 |
-|------|----|----|--------|
-| 维表 Join | 2GB | 4GB | 4 |
-| 流式写 Hive | 2GB | 8GB | 匹配 Kafka 分区数 |
-| 批量读 Hive | 2GB | 4GB | 根据数据量 |
+```yaml
+# Hive ETL 作业推荐配置
+jobmanager.memory.process.size: 4096m
+taskmanager.memory.process.size: 8192m
+taskmanager.numberOfTaskSlots: 4
+parallelism.default: 8
+
+# Hive 写入特有配置
+execution.checkpointing.interval: 120000   # 2min（写 Hive 不宜太频繁）
+sink.rolling-policy.file-size: 128MB
+sink.rolling-policy.rollover-interval: 15min
+auto-compaction: true
+compaction.file-size: 256MB
+```
 
 ### 6.2 关键参数调优
 
-```properties
-execution.checkpointing.interval: 120000
-sink.rolling-policy.file-size: 128MB
-auto-compaction: true
-lookup.join.cache.ttl: 3600000
-taskmanager.memory.managed.fraction: 0.4
-```
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| `execution.checkpointing.interval` | 120s+ | Hive 写入不宜太频繁 |
+| `sink.rolling-policy.file-size` | 128MB | 避免小文件 |
+| `sink.partition-commit.trigger` | partition-time | 基于 Watermark |
+| `sink.partition-commit.delay` | 5min | 等待迟到数据 |
+| `auto-compaction` | true | 自动合并小文件 |
+| `table.exec.hive.fallback-mapred-reader` | true | 兼容旧格式 |
 
 ### 6.3 监控与告警
 
-- 分区提交延迟 > 2h → P2
-- 单分区文件数 > 1000 → P3
-- Checkpoint 连续失败 → P1
-- Metastore 不可达 → P1
+```bash
+# 检查 Hive 分区是否正常产出
+# 定时脚本检查最新分区
+LATEST_PARTITION=$(hive -e "SHOW PARTITIONS dwd.dwd_order_detail" 2>/dev/null | tail -1)
+echo "Latest partition: $LATEST_PARTITION"
+
+# 检查分区数据量
+hive -e "SELECT COUNT(*) FROM dwd.dwd_order_detail WHERE dt = CURRENT_DATE();"
+
+# 检查 HDFS 文件大小（是否有小文件问题）
+hdfs dfs -du -s -h /user/hive/warehouse/dwd.db/dwd_order_detail/dt=$(date +%Y-%m-%d)/
+```
 
 ---
 
 ## 七、举一反三
 
-### 7.1 与其他方案对比
+### 7.1 与其他组件的对比
 
-| 维度 | Flink+Hive | Spark+Hive | Hive Streaming |
-|------|-----------|-----------|----------------|
-| 延迟 | 分钟级 | 分钟级 | 秒级(功能有限) |
-| 格式 | ORC/Parquet/CSV | ORC/Parquet | 仅ORC(ACID) |
-| 维表Join | 支持Lookup | DataFrame Join | 不支持 |
+| 维度 | Flink + Hive | Spark + Hive | Hive on Tez | Flink + Iceberg/Hudi |
+|------|-------------|--------------|-------------|---------------------|
+| 实时写入 | ✅ 流式 | ⚠️ micro-batch | ❌ 批 | ✅ 流式 |
+| 批处理 | ✅ | ✅ | ✅ | ✅ |
+| ACID | ❌ | ❌ | ✅ Hive 3 | ✅ 原生 |
+| 小文件处理 | auto-compaction | 需额外 compact | 需手动 | 自动 compaction |
+| 元数据 | HiveCatalog | 直连 HMS | 直连 HMS | HMS/自带 |
 
 ### 7.2 面试高频题
 
-**Q1: 流式写 Hive 如何保证下游能查到新数据？**
-A: 通过分区提交策略（trigger=partition-time + policy=metastore,success-file），在 Checkpoint 完成时提交分区到 HMS。
+**Q1: Flink 写入 Hive 分区表的原理？**
+> Flink 使用 StreamingFileSink 将数据写入 HDFS 路径（对应 Hive 分区目录），Checkpoint 时文件从 in-progress 变为 finished，分区完成后通过 Metastore API 注册分区（ADD PARTITION），使 Hive 可查询。
 
-**Q2: Lookup Join 原理和限制？**
-A: 基于 PROCTIME() 查询维表，缓存到 TM 内存。限制：仅处理时间、大维表耗内存、变化感知有延迟。
+**Q2: 如何解决 Flink 写入 Hive 的小文件问题？**
+> (1) 增大 `sink.rolling-policy.file-size`（如 128MB/256MB）；(2) 增大 Checkpoint 间隔（2-5min）；(3) 开启 `auto-compaction`；(4) 配合下游 Hive compaction 任务定期合并。
 
-**Q3: 小文件问题解决？**
-A: auto-compaction=true、调大 rolling-policy.file-size、延长 checkpoint 间隔、降低 sink 并行度。
+**Q3: HiveCatalog 和 default_catalog 有什么区别？**
+> default_catalog 是内存 Catalog，表定义随作业消亡而丢失。HiveCatalog 将表元数据持久化到 Hive Metastore，作业重启后表定义仍在，且可与 Hive/Spark 等其他引擎共享。
 
 ### 7.3 思考题
 
-1. Hive 维表 1 亿行，直接 Lookup Join 会怎样？如何优化？
-2. 数据写入 HDFS 但分区未提交导致不一致如何处理？
-3. Flink 写 Hive vs 写 Iceberg/Hudi 再用 Hive 外表查询，各有何优劣？
+1. 设计一个 Flink 实时数仓分层架构：ODS(Kafka) → DWD(Hive) → DWS(Hive) → ADS(MySQL)
+2. 如何用 Flink 实现 Hive 表的实时去重（Exactly-Once + Hive ACID？）
+3. 比较 Flink + Hive 与 Flink + Iceberg 的优缺点
+
+---
+
+> 📝 **教案总结**：Flink + Hive 是实时入湖的主流方案。核心要点：(1) HiveCatalog 实现元数据共享；(2) 分区提交策略决定数据可见性；(3) rolling-policy + auto-compaction 解决小文件；(4) Lookup Join 实现维表关联。
