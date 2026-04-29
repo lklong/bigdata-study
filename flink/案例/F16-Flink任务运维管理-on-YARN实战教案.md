@@ -1,41 +1,27 @@
 # [教案] Flink on YARN — 任务运维管理实战使用姿势
 
-> 🎯 教学目标：掌握 Flink on YARN 的完整运维操作，包括命令大全(提交/查看/取消/停止/恢复)、YARN 日志获取、Web UI 访问、升级流程、并行度调整与扩缩容、资源配置公式、Prometheus+Grafana 监控、常见故障排查 | ⏰ 预计学时: 100分钟 | 📊 难度: ⭐⭐⭐⭐
+> 🎯 教学目标：掌握 Flink on YARN 作业的全生命周期管理、日志排查、升级流程、监控接入 | ⏰ 预计学时: 100分钟 | 📊 难度: ⭐⭐⭐
 
 ---
 
-## 一、课前导入
+## 一、课前导入（什么场景需要用？）
 
-### 1.1 为什么需要掌握运维管理？
+**生活类比**：你是一个养鱼场的管理员，鱼塘里有几十条不同品种的鱼（Flink 作业）。日常工作包括：巡查每条鱼是否健康（监控）、定期换水喂食（参数调整）、生病了治疗（故障排查）、品种升级（代码更新）、旺季增加鱼苗（扩容）。你需要一套标准化的管理流程来确保鱼塘稳定运营。
 
-**生活类比**：开发 Flink 作业就像造一辆车，运维管理就像"开车上路"——你需要知道怎么启动、怎么换挡（调整并行度）、怎么加油（扩资源）、怎么看仪表盘（监控）、怎么处理抛锚（故障排查）。
+**生产场景**：
+- 日常巡检：查看作业运行状态、消费延迟、Checkpoint 是否正常
+- 代码升级：修 Bug 或加新功能后，需要不丢数据地替换旧作业
+- 扩缩容：大促流量暴增需要紧急扩容；促销结束后缩容节省资源
+- 故障处理：Container 被 Kill、TaskManager 丢失、作业重启循环
 
-生产环境中，80% 的时间花在运维上：
-- 作业提交/升级/回滚
-- 性能调优/扩缩容
-- 故障发现/定位/恢复
-- 监控告警
-
-### 1.2 运维操作全景图
-
-```
-┌──────── 生命周期管理 ────────┐
-│ 提交 → 运行 → 停止/取消     │
-│ 恢复 → 升级 → 扩缩容        │
-└─────────────────────────────┘
-
-┌──────── 观测 ────────────────┐
-│ Web UI / REST API            │
-│ YARN 日志 / Container 日志    │
-│ Prometheus + Grafana         │
-└─────────────────────────────┘
-
-┌──────── 故障处理 ────────────┐
-│ CP 失败 / TM Lost           │
-│ Container Kill / OOM         │
-│ 重启循环 / 数据倾斜          │
-└─────────────────────────────┘
-```
+**本教案覆盖的运维场景**：
+1. 作业生命周期管理（提交/查看/取消/恢复）
+2. 日志获取与分析
+3. 标准升级流程
+4. 并行度调整与扩缩容
+5. 资源配置最佳实践
+6. 监控指标接入
+7. 常见故障排查
 
 ---
 
@@ -43,615 +29,924 @@
 
 ### 2.1 环境要求
 
-| 组件 | 说明 |
-|------|------|
-| Flink CLI | `$FLINK_HOME/bin/flink` |
-| YARN CLI | `yarn` 命令可用 |
-| HDFS | 存储 JAR/CP/SP |
-| Prometheus + Grafana | 可选，用于监控 |
+| 组件 | 版本 | 说明 |
+|------|-----|------|
+| Flink | 1.17+ / 1.18+ | 推荐 1.18+ |
+| Hadoop/YARN | 3.x | ResourceManager + NodeManager |
+| HDFS | 3.x | 存储 JAR/Checkpoint/Savepoint/日志 |
+| Java | JDK 8 / 11 | Flink 运行时 |
 
-### 2.2 环境变量
+### 2.2 环境准备
 
 ```bash
-export FLINK_HOME=/opt/flink
+# ========== 基础环境 ==========
+export FLINK_HOME=/opt/flink-1.18.1
 export HADOOP_CONF_DIR=/etc/hadoop/conf
-export HADOOP_CLASSPATH=`hadoop classpath`
-export PATH=$FLINK_HOME/bin:$PATH
+export HADOOP_CLASSPATH=$(hadoop classpath)
+
+# ========== 创建 HDFS 目录 ==========
+hdfs dfs -mkdir -p /flink/jars           # JAR 包存储
+hdfs dfs -mkdir -p /flink/checkpoints    # Checkpoint 存储
+hdfs dfs -mkdir -p /flink/savepoints     # Savepoint 存储
+hdfs dfs -mkdir -p /flink/ha             # 高可用存储
+
+# ========== 确认 YARN 队列可用 ==========
+yarn queue -status flink
+# 确保 flink 队列有足够资源
+
+# ========== 上传 JAR 到 HDFS（推荐方式）==========
+hdfs dfs -put my-flink-job.jar hdfs:///flink/jars/
 ```
 
 ---
 
-## 三、核心使用方式 — 完整命令大全
+## 三、核心使用方式
 
-### 3.1 作业提交
+### 3.1 任务生命周期管理命令大全
+
+#### 3.1.1 提交作业
 
 ```bash
-# ===== Per-Job 模式（已废弃，仅旧版本） =====
-flink run -m yarn-cluster \
-    -ynm "my-flink-job" \
-    -yjm 4096 \
-    -ytm 8192 \
-    -ys 4 \
-    -yD parallelism.default=8 \
-    -c com.example.MyJob \
-    /path/to/my-job.jar
+# ============================================================
+# Application Mode 提交（推荐生产使用）
+# ============================================================
+$FLINK_HOME/bin/flink run-application \
+    -t yarn-application \
+    -Djobmanager.memory.process.size=2048m \
+    -Dtaskmanager.memory.process.size=4096m \
+    -Dtaskmanager.numberOfTaskSlots=2 \
+    -Dparallelism.default=4 \
+    -Dyarn.application.name="MyFlinkJob-v1.0" \
+    -Dyarn.application.queue=flink \
+    -Dexecution.checkpointing.interval=60000 \
+    -Dstate.backend=rocksdb \
+    -Dstate.backend.incremental=true \
+    -Dstate.checkpoints.dir=hdfs:///flink/checkpoints/my-job \
+    -Dstate.savepoints.dir=hdfs:///flink/savepoints/my-job \
+    -c com.example.MyFlinkJob \
+    hdfs:///flink/jars/my-flink-job.jar
 
-# ===== Session 模式 =====
-# 1. 启动 Session
-yarn-session.sh -d \
-    -nm "flink-session" \
-    -jm 4096 \
-    -tm 8192 \
-    -s 4 \
-    -D yarn.application.queue=production
+# 输出: Job has been submitted with JobID <jobId>
+# 记录 YARN Application ID: application_xxxxx_xxxx
 
-# 2. 提交作业到 Session
-flink run -c com.example.MyJob /path/to/my-job.jar
+# ============================================================
+# Per-Job Mode 提交（Flink 1.18+ 已废弃，但老集群还在用）
+# ============================================================
+$FLINK_HOME/bin/flink run \
+    -t yarn-per-job \
+    -Djobmanager.memory.process.size=2048m \
+    -Dtaskmanager.memory.process.size=4096m \
+    -c com.example.MyFlinkJob \
+    my-flink-job.jar
 
-# ===== Application 模式（推荐） =====
-flink run-application -t yarn-application \
-    -Dyarn.application.name="my-flink-app" \
-    -Dyarn.application.queue=production \
-    -Djobmanager.memory.process.size=4096m \
-    -Dtaskmanager.memory.process.size=8192m \
-    -Dtaskmanager.numberOfTaskSlots=4 \
-    -Dparallelism.default=8 \
-    -c com.example.MyJob \
-    hdfs:///flink/jars/my-job.jar
-
-# ===== SQL Client 模式 =====
-# 1. 嵌入模式
-sql-client.sh
-
-# 2. 连接到 Session
-sql-client.sh -s yarn-session
+# ============================================================
+# 从 Savepoint 恢复提交
+# ============================================================
+$FLINK_HOME/bin/flink run-application \
+    -t yarn-application \
+    -Djobmanager.memory.process.size=2048m \
+    -Dtaskmanager.memory.process.size=4096m \
+    -Dparallelism.default=4 \
+    -Dyarn.application.name="MyFlinkJob-v1.1-from-savepoint" \
+    -Dyarn.application.queue=flink \
+    -Dstate.backend=rocksdb \
+    -Dstate.backend.incremental=true \
+    -Dstate.checkpoints.dir=hdfs:///flink/checkpoints/my-job \
+    -s hdfs:///flink/savepoints/my-job/savepoint-xxxxxx-xxxxxxxxxx \
+    -c com.example.MyFlinkJob \
+    hdfs:///flink/jars/my-flink-job-v1.1.jar
 ```
 
-### 3.2 作业查看
+#### 3.1.2 查看作业
 
 ```bash
-# 查看运行中的作业（需要知道 YARN App ID）
-flink list -m yarn-cluster -yid <yarn-application-id>
+# ============================================================
+# 查看作业列表
+# ============================================================
+$FLINK_HOME/bin/flink list \
+    -t yarn-application \
+    -Dyarn.application.id=application_xxxxx_xxxx
 
-# 通过 YARN 查看所有 Flink 应用
-yarn application -list -appTypes APACHE_FLINK
+# 输出:
+# ---- Running/Restarting Jobs -------------------
+# 29.04.2026 14:00:00 : <jobId> : MyFlinkJob (RUNNING)
 
-# 查看作业详情
-flink list -r -yid <yarn-application-id>  # running
-flink list -a -yid <yarn-application-id>  # all (包括完成的)
+# 查看所有状态的作业（包括已完成的）
+$FLINK_HOME/bin/flink list -a \
+    -t yarn-application \
+    -Dyarn.application.id=application_xxxxx_xxxx
 
-# 通过 REST API 查看
-curl http://<jobmanager-host>:<rest-port>/jobs
-curl http://<jobmanager-host>:<rest-port>/jobs/<job-id>
-curl http://<jobmanager-host>:<rest-port>/jobs/<job-id>/checkpoints
+# ============================================================
+# 通过 YARN 命令查看
+# ============================================================
+# 查看所有运行中的 Flink 应用
+yarn application -list -appTypes APACHE_FLINK | grep RUNNING
+
+# 查看特定应用详情
+yarn application -status application_xxxxx_xxxx
+
+# 查看应用尝试次数
+yarn applicationattempt -list application_xxxxx_xxxx
 ```
 
-### 3.3 作业停止/取消
+#### 3.1.3 取消作业
 
 ```bash
-# ===== 优雅停止（带 Savepoint，推荐） =====
-# 先创建 Savepoint 再停止
-flink stop --savepointPath hdfs:///flink/savepoints/ <job-id> -yid <yarn-app-id>
+# ============================================================
+# 直接取消（不保存状态 - 慎用！）
+# ============================================================
+$FLINK_HOME/bin/flink cancel \
+    -t yarn-application \
+    -Dyarn.application.id=application_xxxxx_xxxx \
+    <jobId>
 
-# ===== 取消作业（不带 Savepoint） =====
-flink cancel <job-id> -yid <yarn-app-id>
+# ============================================================
+# 停止 + 保存 Savepoint（推荐方式）
+# ============================================================
+$FLINK_HOME/bin/flink stop \
+    -t yarn-application \
+    -Dyarn.application.id=application_xxxxx_xxxx \
+    --savepointPath hdfs:///flink/savepoints/my-job \
+    <jobId>
 
-# ===== 取消并创建 Savepoint =====
-flink cancel -s hdfs:///flink/savepoints/ <job-id> -yid <yarn-app-id>
+# 输出:
+# Suspending job "xxxxxxxx" with a savepoint.
+# Savepoint completed. Path: hdfs:///flink/savepoints/my-job/savepoint-xxxxxx-xxxxxxxxxx
 
-# ===== 强制杀死 YARN Application =====
-yarn application -kill <yarn-application-id>
+# ============================================================
+# 仅触发 Savepoint（不停止作业）
+# ============================================================
+$FLINK_HOME/bin/flink savepoint \
+    -t yarn-application \
+    -Dyarn.application.id=application_xxxxx_xxxx \
+    <jobId> \
+    hdfs:///flink/savepoints/my-job
+
+# ============================================================
+# 强制杀死 YARN Application（最后手段）
+# ============================================================
+yarn application -kill application_xxxxx_xxxx
 ```
 
-### 3.4 作业恢复
+#### 3.1.4 命令参数速查表
+
+| 命令 | 作用 | 是否保存状态 | 适用场景 |
+|------|------|-----------|---------|
+| `flink stop --savepointPath` | 优雅停止 + Savepoint | ✅ | 升级/迁移 |
+| `flink savepoint` | 触发 Savepoint 不停止 | ✅（不影响运行） | 定期备份 |
+| `flink cancel` | 取消作业 | ❌（除非有 externalized CP） | 废弃作业 |
+| `yarn application -kill` | 杀死 YARN 应用 | ❌ | 作业无响应 |
+
+### 3.2 YARN Application 日志获取
 
 ```bash
-# 从 Savepoint 恢复
-flink run-application -t yarn-application \
-    -s hdfs:///flink/savepoints/savepoint-abc123 \
-    -Dyarn.application.name="my-job-recovered" \
-    -c com.example.MyJob \
-    hdfs:///flink/jars/my-job.jar
+# ============================================================
+# 方式1: yarn logs 命令（最常用）
+# ============================================================
+# 获取整个应用的所有 Container 日志
+yarn logs -applicationId application_xxxxx_xxxx
 
-# 从 Checkpoint 恢复
-flink run-application -t yarn-application \
-    -s hdfs:///flink/checkpoints/<job-id>/chk-100 \
-    -c com.example.MyJob \
-    hdfs:///flink/jars/my-job.jar
+# 获取特定 Container 日志
+yarn logs -applicationId application_xxxxx_xxxx \
+    -containerId container_e01_xxxxx_xxxx_01_000001
 
-# 允许跳过无法恢复的状态
-flink run-application -t yarn-application \
-    -s hdfs:///flink/savepoints/savepoint-abc123 \
-    -Dexecution.savepoint.ignore-unclaimed-state=true \
-    -c com.example.MyJob \
-    hdfs:///flink/jars/my-job.jar
+# 获取 JobManager 日志（通常是第一个 Container）
+yarn logs -applicationId application_xxxxx_xxxx \
+    -containerId container_e01_xxxxx_xxxx_01_000001 \
+    -log_files jobmanager.log
+
+# 获取 TaskManager 日志
+yarn logs -applicationId application_xxxxx_xxxx \
+    -containerId container_e01_xxxxx_xxxx_01_000002 \
+    -log_files taskmanager.log
+
+# 只看 stderr（异常堆栈通常在这里）
+yarn logs -applicationId application_xxxxx_xxxx \
+    -log_files stderr
+
+# 输出到文件
+yarn logs -applicationId application_xxxxx_xxxx > /tmp/flink-app.log 2>&1
+
+# ============================================================
+# 方式2: YARN ResourceManager Web UI
+# ============================================================
+# 访问: http://yarn-rm-host:8088/
+# → Applications → 找到对应 Application → Logs
+# 每个 Container 的 stdout/stderr/jobmanager.log/taskmanager.log 都可查看
+
+# ============================================================
+# 方式3: Flink Web UI（通过 YARN Proxy 访问）
+# ============================================================
+# URL 格式: http://yarn-rm-host:8088/proxy/application_xxxxx_xxxx/
+# 
+# 在 Web UI 中可以:
+# - 查看 Job Graph（DAG）
+# - 查看各算子的 Metrics
+# - 查看 Checkpoint 历史
+# - 查看 TaskManager 日志
+# - 查看异常堆栈
+
+# ============================================================
+# 方式4: HDFS 日志归档（如果配置了 log aggregation）
+# ============================================================
+# yarn-site.xml 中配置:
+# yarn.log-aggregation-enable = true
+# yarn.log-aggregation.retain-seconds = 604800 (7天)
+# yarn.nodemanager.remote-app-log-dir = /tmp/logs
+
+hdfs dfs -ls /tmp/logs/$(whoami)/logs/application_xxxxx_xxxx/
 ```
 
-### 3.5 手动触发 Savepoint
+### 3.3 Flink Web UI 通过 YARN Proxy 访问
 
 ```bash
-# 触发 Savepoint（不停止作业）
-flink savepoint <job-id> hdfs:///flink/savepoints/ -yid <yarn-app-id>
+# ============================================================
+# URL 拼接方式
+# ============================================================
+# 标准 YARN Proxy URL:
+# http://<yarn-rm-host>:<rm-webapp-port>/proxy/<application-id>/
 
-# 使用 REST API 触发
-curl -X POST http://<jm-host>:<port>/jobs/<job-id>/savepoints \
-    -H "Content-Type: application/json" \
-    -d '{"target-directory": "hdfs:///flink/savepoints/", "cancel-job": false}'
+# 示例:
+# http://yarn-rm01:8088/proxy/application_1234567890_0001/
+
+# 如果 YARN RM 开启了 HA:
+# http://<active-rm-host>:8088/proxy/<application-id>/
+# 获取 Active RM:
+yarn rmadmin -getServiceState rm1
+yarn rmadmin -getServiceState rm2
+
+# ============================================================
+# 常用 REST API 端点
+# ============================================================
+BASE_URL="http://yarn-rm01:8088/proxy/application_xxxxx_xxxx"
+
+# 获取作业概览
+curl $BASE_URL/jobs | python -m json.tool
+
+# 获取 Checkpoint 信息
+curl $BASE_URL/jobs/<jobId>/checkpoints | python -m json.tool
+
+# 获取各算子指标
+curl "$BASE_URL/jobs/<jobId>/vertices/<vertexId>/metrics?get=numRecordsInPerSecond,numRecordsOutPerSecond"
+
+# 获取 TaskManager 列表
+curl $BASE_URL/taskmanagers | python -m json.tool
+
+# 获取背压信息
+curl $BASE_URL/jobs/<jobId>/vertices/<vertexId>/backpressure | python -m json.tool
+```
+
+### 3.4 任务升级标准流程
+
+```bash
+#!/bin/bash
+# ============================================================
+# upgrade-flink-job.sh - Flink 作业标准升级脚本
+# ============================================================
+
+set -e
+
+# ===== 配置参数 =====
+FLINK_HOME=/opt/flink-1.18.1
+APP_ID="application_xxxxx_xxxx"
+JOB_NAME="MyFlinkJob"
+SAVEPOINT_DIR="hdfs:///flink/savepoints/my-job"
+NEW_JAR="hdfs:///flink/jars/my-flink-job-v1.1.jar"
+MAIN_CLASS="com.example.MyFlinkJob"
+
+echo "========== Step 1: 获取 Job ID =========="
+JOB_ID=$($FLINK_HOME/bin/flink list \
+    -t yarn-application \
+    -Dyarn.application.id=$APP_ID 2>/dev/null \
+    | grep RUNNING | awk '{print $4}')
+
+if [ -z "$JOB_ID" ]; then
+    echo "ERROR: 未找到运行中的 Job"
+    exit 1
+fi
+echo "当前 Job ID: $JOB_ID"
+
+echo "========== Step 2: 触发 Savepoint 并停止 =========="
+SAVEPOINT_PATH=$($FLINK_HOME/bin/flink stop \
+    -t yarn-application \
+    -Dyarn.application.id=$APP_ID \
+    --savepointPath $SAVEPOINT_DIR \
+    $JOB_ID 2>&1 | grep "Savepoint completed" | awk '{print $NF}')
+
+if [ -z "$SAVEPOINT_PATH" ]; then
+    echo "ERROR: Savepoint 创建失败"
+    exit 1
+fi
+echo "Savepoint 路径: $SAVEPOINT_PATH"
+
+echo "========== Step 3: 验证 Savepoint =========="
+hdfs dfs -ls $SAVEPOINT_PATH/_metadata
+if [ $? -ne 0 ]; then
+    echo "ERROR: Savepoint 文件不完整"
+    exit 1
+fi
+echo "Savepoint 验证通过 ✓"
+
+echo "========== Step 4: 等待旧 Application 结束 =========="
+while yarn application -status $APP_ID 2>/dev/null | grep -q "State : RUNNING"; do
+    echo "等待旧 Application 结束..."
+    sleep 5
+done
+echo "旧 Application 已停止 ✓"
+
+echo "========== Step 5: 从 Savepoint 启动新版本 =========="
+$FLINK_HOME/bin/flink run-application \
+    -t yarn-application \
+    -Djobmanager.memory.process.size=2048m \
+    -Dtaskmanager.memory.process.size=4096m \
+    -Dtaskmanager.numberOfTaskSlots=2 \
+    -Dparallelism.default=4 \
+    -Dyarn.application.name="${JOB_NAME}-v1.1" \
+    -Dyarn.application.queue=flink \
+    -Dstate.backend=rocksdb \
+    -Dstate.backend.incremental=true \
+    -Dexecution.checkpointing.interval=60000 \
+    -Dstate.checkpoints.dir=hdfs:///flink/checkpoints/my-job \
+    -Dstate.savepoints.dir=hdfs:///flink/savepoints/my-job \
+    -s $SAVEPOINT_PATH \
+    -c $MAIN_CLASS \
+    $NEW_JAR
+
+echo "========== Step 6: 验证新作业启动 =========="
+sleep 30  # 等待 YARN 分配资源
+NEW_APP_ID=$(yarn application -list -appTypes APACHE_FLINK 2>/dev/null \
+    | grep "${JOB_NAME}-v1.1" | grep RUNNING | awk '{print $1}')
+
+if [ -z "$NEW_APP_ID" ]; then
+    echo "WARNING: 新作业可能还在启动中，请手动确认"
+    echo "检查命令: yarn application -list | grep $JOB_NAME"
+else
+    echo "新 Application ID: $NEW_APP_ID"
+    echo "Web UI: http://yarn-rm01:8088/proxy/$NEW_APP_ID/"
+fi
+
+echo "========== 升级完成 ✓ =========="
+echo "旧 Savepoint: $SAVEPOINT_PATH（建议保留 7 天后删除）"
+```
+
+### 3.5 并行度调整与扩缩容
+
+```bash
+# ============================================================
+# 方式1: 手动调整并行度（Savepoint → 停止 → 修改并行度 → 恢复）
+# ============================================================
+
+# Step 1: Savepoint + 停止
+$FLINK_HOME/bin/flink stop \
+    -t yarn-application \
+    -Dyarn.application.id=$APP_ID \
+    --savepointPath hdfs:///flink/savepoints/my-job \
+    $JOB_ID
+
+# Step 2: 以新并行度恢复
+$FLINK_HOME/bin/flink run-application \
+    -t yarn-application \
+    -Dparallelism.default=8 \                    # 从 4 调整到 8
+    -Dtaskmanager.numberOfTaskSlots=2 \          # 每个 TM 2 个 slot
+    # Container 数 = ceil(8/2) = 4 个 TM
+    -s $SAVEPOINT_PATH \
+    ...
+
+# ============================================================
+# 方式2: Reactive Mode（自动扩缩容）— Flink 1.18+
+# ============================================================
+# Reactive Mode 下 Flink 会根据可用 TaskSlot 自动调整并行度
+$FLINK_HOME/bin/flink run-application \
+    -t yarn-application \
+    -Dscheduler-mode=reactive \                   # 开启 Reactive Mode
+    -Djobmanager.memory.process.size=2048m \
+    -Dtaskmanager.memory.process.size=4096m \
+    -Dtaskmanager.numberOfTaskSlots=2 \
+    -Dyarn.application.name="MyJob-Reactive" \
+    # 注意: Reactive Mode 下不设 parallelism.default
+    # Flink 会根据 YARN 分配的 Container 数自动调整
+    -c com.example.MyFlinkJob \
+    my-job.jar
+
+# Reactive Mode 扩容: 向 YARN 请求更多 Container
+# Reactive Mode 缩容: YARN 回收 Container 后自动降低并行度
+# 注意: Reactive Mode 仍是实验特性，生产慎用
+
+# ============================================================
+# 方式3: YARN 资源层扩缩容
+# ============================================================
+# 调整 YARN 队列容量
+yarn queue -set capacity flink 30   # 将 flink 队列容量从 20% 调到 30%
+
+# 或通过 Capacity Scheduler 配置
+# <property>
+#   <name>yarn.scheduler.capacity.root.flink.capacity</name>
+#   <value>30</value>
+# </property>
+```
+
+### 3.6 资源配置最佳实践
+
+#### 3.6.1 内存配置详解
+
+```
+┌──────────────────────────────────────────────────────┐
+│           TaskManager Memory Model                   │
+├──────────────────────────────────────────────────────┤
+│                                                      │
+│  taskmanager.memory.process.size = 4096m             │
+│  ├── Framework Heap (128m 固定)                       │
+│  ├── Task Heap (用户代码)                              │
+│  │     = process - framework - managed - network     │
+│  │       - overhead - metaspace                      │
+│  ├── Managed Memory (状态/排序/缓存)                   │
+│  │     = process × 0.4 (默认 40%)                    │
+│  ├── Network Memory (Shuffle Buffer)                 │
+│  │     = process × 0.1 (默认 10%)                    │
+│  ├── JVM Overhead (GC/线程栈/JIT)                     │
+│  │     = process × 0.1 (默认 10%)                    │
+│  └── JVM Metaspace (256m 默认)                        │
+│                                                      │
+│  关键公式:                                             │
+│  Task Heap ≈ process × (1 - 0.4 - 0.1 - 0.1) - 384m │
+│  例: 4096 × 0.4 - 384 = 约 1254m 可用 Task Heap      │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+| 参数 | 默认值 | 生产建议 | 说明 |
+|------|-------|---------|------|
+| `jobmanager.memory.process.size` | 1600m | 2048~4096m | JM 进程总内存 |
+| `taskmanager.memory.process.size` | 1728m | 4096~16384m | TM 进程总内存 |
+| `taskmanager.numberOfTaskSlots` | 1 | 2~4 | 每个 TM 的 Slot 数 |
+| `taskmanager.memory.managed.fraction` | 0.4 | 0.3~0.5 | Managed 内存占比 |
+| `taskmanager.network.memory.fraction` | 0.1 | 0.1~0.15 | Network 内存占比 |
+| `taskmanager.memory.jvm-overhead.fraction` | 0.1 | 0.1 | JVM Overhead 占比 |
+
+#### 3.6.2 Container 数量计算公式
+
+```
+总并行度 = 所有算子的最大并行度
+Container(TM) 数 = ceil(总并行度 / taskmanager.numberOfTaskSlots)
+总 Container 数 = TM Container 数 + 1 (JM Container)
+
+示例:
+  并行度 = 12, Slot = 2
+  TM 数 = ceil(12/2) = 6
+  总 Container = 6 + 1 = 7
+  
+资源总量:
+  JM: 1 × 2048m = 2GB
+  TM: 6 × 4096m = 24GB
+  总内存需求: 26GB
+  总 vCore: 7 (每 Container 1 vCore 默认)
+```
+
+#### 3.6.3 不同场景资源配置模板
+
+```yaml
+# ===== 场景1: 轻量 ETL（低状态、低延迟） =====
+jobmanager.memory.process.size: 2048m
+taskmanager.memory.process.size: 2048m
+taskmanager.numberOfTaskSlots: 2
+parallelism.default: 4
+# Container: 1 JM + 2 TM = 3 个, 总内存 ~6GB
+
+# ===== 场景2: 中等聚合统计（中状态、RocksDB） =====
+jobmanager.memory.process.size: 2048m
+taskmanager.memory.process.size: 4096m
+taskmanager.numberOfTaskSlots: 2
+parallelism.default: 8
+taskmanager.memory.managed.fraction: 0.4
+# Container: 1 JM + 4 TM = 5 个, 总内存 ~18GB
+
+# ===== 场景3: 大状态 Join/窗口（TB级状态） =====
+jobmanager.memory.process.size: 4096m
+taskmanager.memory.process.size: 8192m
+taskmanager.numberOfTaskSlots: 2
+parallelism.default: 16
+taskmanager.memory.managed.fraction: 0.5
+state.backend: rocksdb
+state.backend.incremental: true
+# Container: 1 JM + 8 TM = 9 个, 总内存 ~70GB
+
+# ===== 场景4: 超高吞吐流处理（Kafka 100+ 分区） =====
+jobmanager.memory.process.size: 4096m
+taskmanager.memory.process.size: 16384m
+taskmanager.numberOfTaskSlots: 4
+parallelism.default: 48
+taskmanager.network.memory.fraction: 0.15
+# Container: 1 JM + 12 TM = 13 个, 总内存 ~200GB
 ```
 
 ---
 
 ## 四、完整实战示例
 
-### 4.1 场景一：YARN 日志获取
+### 4.1 场景描述
+
+完整演示一个 Flink 作业的生命周期管理：提交 → 监控 → 升级 → 扩容 → 故障恢复。
+
+### 4.2 完整操作流程
 
 ```bash
-# 方式1：获取已完成应用的全部日志
-yarn logs -applicationId <yarn-app-id>
+# ============================================================
+# Phase 1: 提交作业
+# ============================================================
+APP_NAME="OrderPipeline-v1.0"
 
-# 方式2：获取特定 Container 的日志
-yarn logs -applicationId <yarn-app-id> -containerId <container-id>
+$FLINK_HOME/bin/flink run-application \
+    -t yarn-application \
+    -Djobmanager.memory.process.size=2048m \
+    -Dtaskmanager.memory.process.size=4096m \
+    -Dtaskmanager.numberOfTaskSlots=2 \
+    -Dparallelism.default=4 \
+    -Dyarn.application.name=$APP_NAME \
+    -Dyarn.application.queue=flink \
+    -Dexecution.checkpointing.interval=60000 \
+    -Dexecution.checkpointing.externalized-checkpoint-retention=RETAIN_ON_CANCELLATION \
+    -Dstate.backend=rocksdb \
+    -Dstate.backend.incremental=true \
+    -Dstate.checkpoints.dir=hdfs:///flink/checkpoints/order-pipeline \
+    -Dstate.savepoints.dir=hdfs:///flink/savepoints/order-pipeline \
+    -Drestart-strategy=fixed-delay \
+    -Drestart-strategy.fixed-delay.attempts=3 \
+    -Drestart-strategy.fixed-delay.delay=30s \
+    -c com.example.OrderPipeline \
+    hdfs:///flink/jars/order-pipeline-1.0.jar
 
-# 方式3：获取运行中应用的日志（实时）
-yarn logs -applicationId <yarn-app-id> -am  # 只看 AM(JM) 日志
+# 获取 Application ID
+APP_ID=$(yarn application -list -appTypes APACHE_FLINK 2>/dev/null \
+    | grep "$APP_NAME" | grep RUNNING | awk '{print $1}')
+echo "Application ID: $APP_ID"
 
-# 方式4：按关键字搜索
-yarn logs -applicationId <yarn-app-id> | grep -i "exception\|error\|oom"
+# ============================================================
+# Phase 2: 日常监控
+# ============================================================
+# 获取 Job ID
+JOB_ID=$($FLINK_HOME/bin/flink list \
+    -t yarn-application \
+    -Dyarn.application.id=$APP_ID 2>/dev/null \
+    | grep RUNNING | awk '{print $4}')
+echo "Job ID: $JOB_ID"
 
-# 方式5：获取 Container 日志目录
-# 运行中的 Container 日志在 NodeManager 本地：
-# /data/yarn/logs/<user>/logs/<app-id>/<container-id>/
+# 查看 Checkpoint 状态
+curl -s "http://yarn-rm01:8088/proxy/$APP_ID/jobs/$JOB_ID/checkpoints" \
+    | python -m json.tool | head -30
 
-# 方式6：Web UI 查看日志
-# YARN ResourceManager UI → Application → Logs
-echo "http://$(hostname):8088/cluster/app/<yarn-app-id>"
+# 查看背压
+curl -s "http://yarn-rm01:8088/proxy/$APP_ID/jobs/$JOB_ID/vertices" \
+    | python -m json.tool
+
+# ============================================================
+# Phase 3: 代码升级（v1.0 → v1.1）
+# ============================================================
+# 上传新版本 JAR
+hdfs dfs -put -f order-pipeline-1.1.jar hdfs:///flink/jars/
+
+# 停止 + Savepoint
+SP_PATH=$($FLINK_HOME/bin/flink stop \
+    -t yarn-application \
+    -Dyarn.application.id=$APP_ID \
+    --savepointPath hdfs:///flink/savepoints/order-pipeline \
+    $JOB_ID 2>&1 | grep "Savepoint completed" | awk -F': ' '{print $2}')
+echo "Savepoint: $SP_PATH"
+
+# 等待旧应用结束
+sleep 10
+
+# 从 Savepoint 启动新版本
+$FLINK_HOME/bin/flink run-application \
+    -t yarn-application \
+    -Djobmanager.memory.process.size=2048m \
+    -Dtaskmanager.memory.process.size=4096m \
+    -Dtaskmanager.numberOfTaskSlots=2 \
+    -Dparallelism.default=4 \
+    -Dyarn.application.name="OrderPipeline-v1.1" \
+    -Dyarn.application.queue=flink \
+    -Dexecution.checkpointing.interval=60000 \
+    -Dstate.backend=rocksdb \
+    -Dstate.backend.incremental=true \
+    -Dstate.checkpoints.dir=hdfs:///flink/checkpoints/order-pipeline \
+    -s $SP_PATH \
+    -c com.example.OrderPipeline \
+    hdfs:///flink/jars/order-pipeline-1.1.jar
+
+# ============================================================
+# Phase 4: 扩容（并行度 4 → 8）
+# ============================================================
+# 获取新 APP_ID 和 JOB_ID
+NEW_APP_ID=$(yarn application -list -appTypes APACHE_FLINK | grep "v1.1" | awk '{print $1}')
+NEW_JOB_ID=$($FLINK_HOME/bin/flink list -t yarn-application \
+    -Dyarn.application.id=$NEW_APP_ID | grep RUNNING | awk '{print $4}')
+
+# Savepoint + 停止
+SP_PATH2=$($FLINK_HOME/bin/flink stop \
+    -t yarn-application \
+    -Dyarn.application.id=$NEW_APP_ID \
+    --savepointPath hdfs:///flink/savepoints/order-pipeline \
+    $NEW_JOB_ID 2>&1 | grep "Savepoint completed" | awk -F': ' '{print $2}')
+
+# 以新并行度恢复
+$FLINK_HOME/bin/flink run-application \
+    -t yarn-application \
+    -Djobmanager.memory.process.size=2048m \
+    -Dtaskmanager.memory.process.size=4096m \
+    -Dtaskmanager.numberOfTaskSlots=2 \
+    -Dparallelism.default=8 \
+    -Dyarn.application.name="OrderPipeline-v1.1-scaled" \
+    -Dyarn.application.queue=flink \
+    -Dstate.backend=rocksdb \
+    -Dstate.backend.incremental=true \
+    -Dstate.checkpoints.dir=hdfs:///flink/checkpoints/order-pipeline \
+    -s $SP_PATH2 \
+    -c com.example.OrderPipeline \
+    hdfs:///flink/jars/order-pipeline-1.1.jar
 ```
 
-### 4.2 场景二：Web UI 访问
+### 4.3 监控指标接入
 
-```bash
-# 获取 Flink Web UI 地址
-# 方式1：从 YARN 获取
-yarn application -status <yarn-app-id> | grep "Tracking-URL"
-
-# 方式2：通过 YARN Proxy（推荐，安全环境）
-echo "http://yarn-rm-host:8088/proxy/<yarn-app-id>/"
-
-# 方式3：直接访问 JM（需要知道 JM 所在节点）
-# 从 YARN 获取 AM Container 所在节点
-yarn application -status <yarn-app-id> | grep "AM Host"
-# 默认端口：8081
-
-# Web UI 关键页面
-# /jobs                    - 作业列表
-# /jobs/<id>              - 作业详情
-# /jobs/<id>/checkpoints  - CP 信息
-# /taskmanagers           - TM 列表
-# /jobmanager/config      - JM 配置
-# /jobmanager/metrics     - JM 指标
-```
-
-### 4.3 场景三：作业升级流程
-
-```bash
-# 标准升级流程（零数据丢失）
-
-# Step 1: 触发 Savepoint 并停止当前作业
-flink stop --savepointPath hdfs:///flink/savepoints/ <old-job-id> -yid <old-app-id>
-# 记录 Savepoint 路径: hdfs:///flink/savepoints/savepoint-xxx
-
-# Step 2: 部署新版本 JAR
-hdfs dfs -put my-job-v2.jar hdfs:///flink/jars/my-job-v2.jar
-
-# Step 3: 从 Savepoint 启动新版本
-flink run-application -t yarn-application \
-    -s hdfs:///flink/savepoints/savepoint-xxx \
-    -Dyarn.application.name="my-job-v2" \
-    -c com.example.MyJob \
-    hdfs:///flink/jars/my-job-v2.jar
-
-# Step 4: 验证新版本正常运行
-flink list -m yarn-cluster -yid <new-app-id>
-# 检查 CP 是否正常、数据是否正常处理
-
-# Step 5: 清理旧版本（确认无问题后）
-hdfs dfs -rm hdfs:///flink/jars/my-job-v1.jar
-```
-
-### 4.4 场景四：并行度调整与扩缩容
-
-```bash
-# Flink 1.18+ 支持 Reactive Mode（自动扩缩容）
-flink run-application -t yarn-application \
-    -Dscheduler-mode=reactive \
-    -Dyarn.application.name="reactive-job" \
-    -c com.example.MyJob \
-    hdfs:///flink/jars/my-job.jar
-
-# 手动扩缩容流程（传统方式）
-# 1. 停止 + Savepoint
-flink stop --savepointPath hdfs:///flink/savepoints/ <job-id> -yid <app-id>
-
-# 2. 以新并行度恢复
-flink run-application -t yarn-application \
-    -s hdfs:///flink/savepoints/savepoint-xxx \
-    -Dparallelism.default=16 \
-    -Dtaskmanager.numberOfTaskSlots=4 \
-    -c com.example.MyJob \
-    hdfs:///flink/jars/my-job.jar
-# 新并行度16 / 4slots = 需要 4 个 TM
-
-# Session 模式下动态添加 TM
-# 通过 YARN 命令增加 Container
-yarn container -signal <container-id> <signal>
-```
-
-### 4.5 场景五：JM/TM 资源配置公式
-
-```bash
-# ===== JobManager 内存配置 =====
-# JM 内存 = JVM Heap + Off-Heap + Metaspace + Overhead
-# 推荐：小作业 2-4GB，大作业 4-8GB
--Djobmanager.memory.process.size=4096m
--Djobmanager.memory.heap.size=2048m         # 可选，否则自动计算
-
-# ===== TaskManager 内存配置 =====
-# TM 总内存 = Framework Heap + Task Heap + Managed + Network + Framework Off-Heap + Task Off-Heap + Metaspace + Overhead
--Dtaskmanager.memory.process.size=8192m
-
-# 各部分计算：
-# Task Heap: 业务逻辑使用（推荐总内存的 40-60%）
--Dtaskmanager.memory.task.heap.size=3072m
-
-# Managed Memory: RocksDB/排序/缓存（推荐总内存的 30-40%）
--Dtaskmanager.memory.managed.fraction=0.4
-
-# Network: 网络缓冲区（推荐总内存的 10%）
--Dtaskmanager.memory.network.fraction=0.1
--Dtaskmanager.memory.network.min=256mb
--Dtaskmanager.memory.network.max=1024mb
-
-# ===== 资源计算公式 =====
-# TM 数量 = ceil(parallelism / taskmanager.numberOfTaskSlots)
-# 例：并行度=16, slots=4 → 需要 4 个 TM
-
-# 总内存 = JM内存 + TM数量 × TM内存
-# 例：4096 + 4 × 8192 = 36864 MB ≈ 36GB
-
-# Slot 数量选择：
-# CPU 密集型：slots = CPU cores per TM
-# IO 密集型：slots = 2~4 × CPU cores per TM
-```
-
-### 4.6 场景六：Prometheus + Grafana 监控
-
-#### 配置 Flink Metrics Reporter
+#### Prometheus + Grafana 配置
 
 ```yaml
-# flink-conf.yaml
-metrics.reporters: prom
+# ============================================================
+# flink-conf.yaml - Prometheus 监控配置
+# ============================================================
 metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
-metrics.reporter.prom.port: 9249
+metrics.reporter.prom.port: 9249-9260    # 端口范围（多 TM 场景）
 
-# 如果在 YARN 上，使用随机端口 + Pushgateway
-metrics.reporter.promgateway.factory.class: org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterFactory
-metrics.reporter.promgateway.hostUrl: http://pushgateway:9091
-metrics.reporter.promgateway.jobName: flink-metrics
-metrics.reporter.promgateway.randomJobNameSuffix: true
-metrics.reporter.promgateway.deleteOnShutdown: false
-metrics.reporter.promgateway.groupingKey: "instance=flink-yarn"
+# 可选: 推送到 Pushgateway（适用于 YARN 动态 Container）
+# metrics.reporter.promgateway.factory.class: org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterFactory
+# metrics.reporter.promgateway.hostUrl: http://pushgateway:9091
+# metrics.reporter.promgateway.jobName: flink-metrics
+# metrics.reporter.promgateway.randomJobNameSuffix: true
+# metrics.reporter.promgateway.deleteOnShutdown: false
+# metrics.reporter.promgateway.groupingKey: "instance={{hostname}}"
+
+# 指标过滤（减少指标数量）
+metrics.scope.jm: <host>.jobmanager
+metrics.scope.jm.job: <host>.jobmanager.<job_name>
+metrics.scope.tm: <host>.taskmanager.<tm_id>
+metrics.scope.tm.job: <host>.taskmanager.<tm_id>.<job_name>
+metrics.scope.task: <host>.taskmanager.<tm_id>.<job_name>.<task_name>.<subtask_index>
+metrics.scope.operator: <host>.taskmanager.<tm_id>.<job_name>.<operator_name>.<subtask_index>
 ```
 
-#### Prometheus 配置
+#### 关键监控指标
 
-```yaml
-# prometheus.yml
-scrape_configs:
-  # 方式1：直接抓取（Session模式，端口固定）
-  - job_name: 'flink'
-    static_configs:
-      - targets: ['flink-jm:9249', 'flink-tm-1:9249', 'flink-tm-2:9249']
+| 分类 | 指标名 | 含义 | 告警阈值 |
+|------|-------|------|---------|
+| **吞吐** | `numRecordsInPerSecond` | 每秒输入记录数 | 持续为0 → 告警 |
+| **吞吐** | `numRecordsOutPerSecond` | 每秒输出记录数 | 骤降50%+ → 告警 |
+| **延迟** | `currentInputWatermark` | 当前水位线（反映事件时间延迟） | 与当前时间差 >5min → 告警 |
+| **Kafka** | `pendingRecords` | Kafka 未消费消息数 | >100000 → 告警 |
+| **Kafka** | `committedOffsets` | 已提交 offset | 长期不变 → 告警 |
+| **CP** | `lastCheckpointDuration` | 最近 CP 耗时 | > interval × 50% → 预警 |
+| **CP** | `lastCheckpointSize` | 最近 CP 大小 | 持续增长 → 预警 |
+| **CP** | `numberOfFailedCheckpoints` | 失败 CP 数 | > 0 → 告警 |
+| **背压** | `isBackPressured` | 是否背压 | = true 持续 >5min → 告警 |
+| **JVM** | `Status.JVM.GarbageCollector.*.Time` | GC 耗时 | Full GC >10s → 告警 |
+| **JVM** | `Status.JVM.Memory.Heap.Used` | 堆内存使用 | >90% → 告警 |
+| **作业** | `numRestarts` | 作业重启次数 | 短时间内 >3 → 告警 |
+| **TM** | `Status.Shuffle.Netty.UsedMemorySegments` | 网络缓冲使用 | 接近上限 → 预警 |
 
-  # 方式2：通过 Pushgateway（YARN模式推荐）
-  - job_name: 'flink-pushgateway'
-    static_configs:
-      - targets: ['pushgateway:9091']
-```
+#### Grafana Dashboard 模板（关键面板）
 
-#### 关键 Grafana Dashboard 指标
-
-```
-# 作业概览
-- flink_jobmanager_job_uptime: 运行时长
-- flink_jobmanager_job_numRestarts: 重启次数
-- flink_jobmanager_job_lastCheckpointDuration: 最近CP耗时
-- flink_jobmanager_job_lastCheckpointSize: 最近CP大小
-
-# 吞吐量
-- rate(flink_taskmanager_job_task_numRecordsIn[1m]): 输入速率
-- rate(flink_taskmanager_job_task_numRecordsOut[1m]): 输出速率
-- rate(flink_taskmanager_job_task_numBytesIn[1m]): 输入字节率
-
-# 延迟
-- flink_taskmanager_job_task_operator_currentInputWatermark: 当前 Watermark
-- flink_taskmanager_job_latency_source_id_*: Source 到 Sink 延迟
-
-# 反压
-- flink_taskmanager_job_task_isBackPressured: 是否反压
-- flink_taskmanager_job_task_busyTimeMsPerSecond: 算子繁忙率
-
-# JVM
-- flink_taskmanager_Status_JVM_Memory_Heap_Used: 堆内存使用
-- flink_taskmanager_Status_JVM_GarbageCollector_G1_Old_Generation_Count: Full GC 次数
-- flink_taskmanager_Status_JVM_Threads_Count: 线程数
-```
-
-### 4.7 场景七：常见故障排查
-
-#### Container 被 Kill (OOM)
-
-```bash
-# 1. 确认是 YARN Kill
-yarn logs -applicationId <app-id> | grep "Container killed"
-# 输出: Container [xxx] is running beyond physical memory limits
-
-# 2. 解决方案
-# 增加 TM 内存
--Dtaskmanager.memory.process.size=12288m
-
-# 关闭 YARN 严格内存检查（临时）
-yarn.nodemanager.pmem-check-enabled=false
-yarn.nodemanager.vmem-check-enabled=false
-
-# 或增加 overhead
--Dtaskmanager.memory.jvm-overhead.fraction=0.15
-```
-
-#### TM Lost
-
-```bash
-# 1. 检查 YARN NodeManager 日志
-ssh <nm-host> && tail -500 /var/log/hadoop-yarn/yarn-yarn-nodemanager-*.log | grep "container\|kill"
-
-# 2. 常见原因
-# - 磁盘满 → 清理日志/临时文件
-# - 网络断开 → 检查交换机/网线
-# - NM 进程挂了 → 重启 NM
-# - 节点维护 → 等待/手动恢复
-```
-
-#### Checkpoint 失败
-
-```bash
-# 1. Web UI → Checkpoints → 查看失败原因
-
-# 2. 常见原因及解决
-# Timeout → 增大 timeout / 开启增量CP / 非对齐CP
-# Declined → 查看 TM 日志（磁盘满/内存不足）
-# Expired → 减少 CP 频率 / 增大 min-pause
-
-# 3. 开启 CP 调试日志
--Dlog4j.logger.org.apache.flink.runtime.checkpoint=DEBUG
-```
-
-#### 重启循环
-
-```bash
-# 1. 查看重启原因
-yarn logs -applicationId <app-id> | grep -B5 "restarting\|restart strategy"
-
-# 2. 配置重启策略
--Drestart-strategy=fixed-delay
--Drestart-strategy.fixed-delay.attempts=10
--Drestart-strategy.fixed-delay.delay=30s
-
-# 3. 如果是 OOM 导致的循环重启
-# 增加内存 或 优化业务逻辑（减少状态大小）
+```json
+{
+  "panels": [
+    {
+      "title": "Records In/Out Per Second",
+      "targets": [
+        {"expr": "flink_taskmanager_job_task_operator_numRecordsInPerSecond"},
+        {"expr": "flink_taskmanager_job_task_operator_numRecordsOutPerSecond"}
+      ]
+    },
+    {
+      "title": "Checkpoint Duration",
+      "targets": [
+        {"expr": "flink_jobmanager_job_lastCheckpointDuration"}
+      ]
+    },
+    {
+      "title": "Kafka Consumer Lag",
+      "targets": [
+        {"expr": "flink_taskmanager_job_task_operator_KafkaSourceReader_KafkaConsumer_records_lag_max"}
+      ]
+    },
+    {
+      "title": "Heap Memory Usage",
+      "targets": [
+        {"expr": "flink_taskmanager_Status_JVM_Memory_Heap_Used / flink_taskmanager_Status_JVM_Memory_Heap_Max"}
+      ]
+    }
+  ]
+}
 ```
 
 ---
 
-## 五、常见问题与排障总表
+## 五、常见问题与排障
 
-| # | 现象 | 原因 | 解决方案 |
-|---|------|------|----------|
-| 1 | Container 被 Kill | 物理内存超限(OOM) | 增大 TM 内存/增大 overhead/关闭 pmem-check |
-| 2 | TM Lost/断连 | 节点故障/NM 挂了 | 检查 NM 日志，等待自动恢复 |
-| 3 | CP 超时 | 状态大/反压 | 增量CP/非对齐CP/增大timeout |
-| 4 | 持续反压 | 下游慢/数据倾斜 | 增加并行度/优化Sink/解决倾斜 |
-| 5 | 重启循环 | 代码bug/资源不足 | 查日志定位异常/增加资源 |
-| 6 | 作业提交失败 | YARN 队列资源不足 | 检查队列容量/等待/换队列 |
-| 7 | Savepoint 恢复失败 | 算子UID变更 | 设置uid()/用allowNonRestoredState |
-| 8 | 数据延迟越来越大 | 吞吐跟不上输入 | 增加并行度/优化逻辑/增加资源 |
-| 9 | Web UI 无法访问 | 代理问题/端口 | 通过 YARN Proxy 访问 |
-| 10 | GC 频繁 | 堆内存不足/对象过多 | 增大堆/优化数据结构/减少状态 |
+| 问题现象 | 原因 | 解决方案 |
+|---------|------|---------|
+| **YARN Container 被 Kill** `Container killed by YARN for exceeding memory limits` | TM 物理内存（含堆外）超过 YARN Container 限制 | 增大 `taskmanager.memory.process.size`；减小 `taskmanager.memory.jvm-overhead.fraction`；检查是否有内存泄漏 |
+| **TaskManager Lost** `Connection to TaskManager lost` | TM 进程 OOM/崩溃或网络断开 | 查看 TM Container 日志定位 OOM 原因；增大内存；检查 GC |
+| **Checkpoint 持续失败** | 背压/HDFS 慢/状态过大/超时 | 见 F15 教案详细排查步骤 |
+| **任务重启循环** `Job entered RESTARTING` | 异常未处理导致 Task 反复失败 | 查看异常堆栈定位根因；增大重启间隔/次数；修复代码 Bug |
+| **提交失败** `Could not submit job` | YARN 队列资源不足或 JAR 找不到 | 检查队列剩余资源 `yarn queue -status`；确认 JAR 路径正确 |
+| **作业无法取消** `Cancel command timed out` | AM 无响应或 JM 挂掉 | 使用 `yarn application -kill` 强制终止 |
+| **Savepoint 创建失败** | Source 不支持暂停/Sink 不支持 flush | 使用 `flink cancel --withSavepoint` 替代 stop |
+| **从 Savepoint 恢复失败** | Operator UID 变更/状态不兼容 | 保持 UID 一致；使用 `--allowNonRestoredState` 跳过不兼容状态 |
+| **YARN 资源不足** `AM Container not allocated` | 队列无空闲资源 | 等待资源释放；调整队列配置；抢占低优先级作业 |
+| **Flink Web UI 无法访问** | YARN Proxy 未启动或防火墙 | 确认 `yarn.web-proxy.address` 配置；检查网络 |
+
+### 详细排障流程
+
+```bash
+# ============================================================
+# 故障1: Container 被 Kill（最常见）
+# ============================================================
+# 1. 查看 YARN 事件
+yarn application -status $APP_ID | grep -A5 "Diagnostics"
+
+# 2. 查看被 Kill 的 Container
+yarn logs -applicationId $APP_ID -log_files stderr | grep -i "kill\|memory\|exceed"
+
+# 3. 计算实际内存使用
+# Container 限制 = taskmanager.memory.process.size × (1 + yarn.nodemanager.vmem-pmem-ratio)
+# 如果 vmem 超限（虚拟内存），在 yarn-site.xml 中设置:
+# yarn.nodemanager.vmem-check-enabled = false
+
+# 4. 解决方案
+# 增大 TM 内存:
+-Dtaskmanager.memory.process.size=8192m
+
+# ============================================================
+# 故障2: 作业重启循环
+# ============================================================
+# 1. 查看异常堆栈
+yarn logs -applicationId $APP_ID -log_files taskmanager.log | grep -A20 "Exception\|Error" | head -50
+
+# 2. 常见原因:
+# - NPE（数据格式异常）→ 代码加空值检查
+# - ClassNotFoundException → JAR 依赖缺失
+# - Kafka offset 越界 → 重置 offset
+# - 反序列化失败 → 数据格式变更
+
+# 3. 临时措施: 增大重启间隔和次数
+-Drestart-strategy=fixed-delay
+-Drestart-strategy.fixed-delay.attempts=10
+-Drestart-strategy.fixed-delay.delay=60s
+
+# ============================================================
+# 故障3: TaskManager Lost
+# ============================================================
+# 1. 查看 JM 日志
+yarn logs -applicationId $APP_ID -containerId <jm-container> -log_files jobmanager.log \
+    | grep "TaskManager.*lost\|heartbeat.*timeout"
+
+# 2. 查看丢失的 TM Container 的 NodeManager 日志
+# 在对应 NodeManager 节点:
+cat /var/log/hadoop/yarn/yarn-yarn-nodemanager-*.log | grep <container-id>
+
+# 3. 常见原因:
+# - NM 节点宕机/重启
+# - 网络分区
+# - GC 暂停超过心跳超时
+# 解决: 
+-Dheartbeat.timeout=180000    # 增大心跳超时（默认50s）
+-Dheartbeat.interval=10000     # 心跳间隔
+```
 
 ---
 
 ## 六、生产最佳实践
 
-### 6.1 作业提交标准模板
+### 6.1 资源配置建议
+
+**黄金法则**：
+1. **JM 内存**：一般 2~4GB 足够，超大 DAG（>100 算子）可调到 8GB
+2. **TM 内存**：根据状态大小决定，无状态 ETL 用 2~4GB，有状态用 4~16GB
+3. **Slot 数**：建议 2~4，与 CPU 核数匹配
+4. **并行度**：等于 Kafka 分区数（Source 算子）；下游算子可适当调小
+
+### 6.2 作业命名规范
+
+```bash
+# 推荐命名格式:
+# <团队>-<业务>-<版本>-<环境>
+# 示例:
+-Dyarn.application.name="data-team-order-pipeline-v1.2-prod"
+-Dyarn.application.name="risk-team-fraud-detection-v2.0-staging"
+```
+
+### 6.3 日常运维 Checklist
 
 ```bash
 #!/bin/bash
-# submit-flink-job.sh - 生产环境标准提交脚本
+# daily-check.sh - Flink 作业日常巡检脚本
 
-JOB_NAME="${1:-my-flink-job}"
-JAR_PATH="${2:-hdfs:///flink/jars/my-job.jar}"
-MAIN_CLASS="${3:-com.example.MyJob}"
-SAVEPOINT_PATH="${4:-}"  # 可选，恢复时传入
+echo "===== Flink 作业巡检 $(date) ====="
 
-FLINK_ARGS=(
-    -t yarn-application
-    -Dyarn.application.name="${JOB_NAME}"
-    -Dyarn.application.queue=production
-    -Djobmanager.memory.process.size=4096m
-    -Dtaskmanager.memory.process.size=8192m
-    -Dtaskmanager.numberOfTaskSlots=4
-    -Dparallelism.default=8
-    # Checkpoint
-    -Dexecution.checkpointing.interval=60000
-    -Dexecution.checkpointing.mode=EXACTLY_ONCE
-    -Dexecution.checkpointing.min-pause=30000
-    -Dexecution.checkpointing.timeout=600000
-    -Dexecution.checkpointing.tolerable-failed-checkpoints=5
-    -Dexecution.checkpointing.externalized-checkpoint-retention=RETAIN_ON_CANCELLATION
-    # State
-    -Dstate.backend=rocksdb
-    -Dstate.backend.incremental=true
-    -Dstate.checkpoints.dir=hdfs:///flink/checkpoints
-    -Dstate.savepoints.dir=hdfs:///flink/savepoints
-    -Dstate.checkpoints.num-retained=3
-    # Metrics
-    -Dmetrics.reporter.promgateway.factory.class=org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterFactory
-    -Dmetrics.reporter.promgateway.hostUrl=http://pushgateway:9091
-    -Dmetrics.reporter.promgateway.jobName=${JOB_NAME}
-    # Restart
-    -Drestart-strategy=fixed-delay
-    -Drestart-strategy.fixed-delay.attempts=10
-    -Drestart-strategy.fixed-delay.delay=30s
-)
+# 1. 检查所有运行中的 Flink 应用
+echo "--- 运行中的 Flink 应用 ---"
+yarn application -list -appTypes APACHE_FLINK 2>/dev/null | grep RUNNING
 
-# 如果有 Savepoint，添加恢复参数
-if [ -n "$SAVEPOINT_PATH" ]; then
-    FLINK_ARGS+=(-s "$SAVEPOINT_PATH")
-fi
+# 2. 检查 Checkpoint 状态
+for APP_ID in $(yarn application -list -appTypes APACHE_FLINK 2>/dev/null | grep RUNNING | awk '{print $1}'); do
+    echo "--- $APP_ID Checkpoint ---"
+    JOB_ID=$(curl -s "http://yarn-rm01:8088/proxy/$APP_ID/jobs" \
+        | python -c "import sys,json;jobs=json.load(sys.stdin).get('jobs',[]);print(jobs[0]['id'] if jobs else '')" 2>/dev/null)
+    if [ -n "$JOB_ID" ]; then
+        curl -s "http://yarn-rm01:8088/proxy/$APP_ID/jobs/$JOB_ID/checkpoints" \
+            | python -c "import sys,json;d=json.load(sys.stdin);print(f'  Last CP: {d.get(\"latest\",{}).get(\"completed\",{}).get(\"duration\",\"N/A\")}ms, Failed: {d.get(\"counts\",{}).get(\"failed\",0)}')" 2>/dev/null
+    fi
+done
 
-# 提交
-flink run-application "${FLINK_ARGS[@]}" -c "$MAIN_CLASS" "$JAR_PATH"
-```
+# 3. 检查 HDFS Checkpoint 目录大小
+echo "--- Checkpoint 存储 ---"
+hdfs dfs -du -h /flink/checkpoints/ 2>/dev/null | tail -10
 
-### 6.2 日常运维 Checklist
+# 4. 检查 YARN 队列资源
+echo "--- YARN flink 队列 ---"
+yarn queue -status flink 2>/dev/null | grep -E "Capacity|Used|Available"
 
-```bash
-# 每日巡检脚本
-#!/bin/bash
-
-echo "=== Flink Applications on YARN ==="
-yarn application -list -appTypes APACHE_FLINK
-
-echo "=== Failed Applications (last 24h) ==="
-yarn application -list -appStates FAILED | tail -20
-
-echo "=== YARN Queue Usage ==="
-yarn queue -status production
-
-echo "=== HDFS Checkpoint 空间 ==="
-hdfs dfs -du -h /flink/checkpoints/ | tail -10
-
-echo "=== 告警检查 ==="
-# 检查 Prometheus 告警
-curl -s http://alertmanager:9093/api/v1/alerts | python3 -m json.tool
-```
-
-### 6.3 告警规则
-
-```yaml
-groups:
-  - name: flink-ops-alerts
-    rules:
-      - alert: FlinkJobDown
-        expr: absent(flink_jobmanager_job_uptime) == 1
-        for: 5m
-        annotations:
-          summary: "Flink 作业不在运行"
-
-      - alert: FlinkHighRestarts
-        expr: increase(flink_jobmanager_job_numRestarts[1h]) > 5
-        for: 1m
-        annotations:
-          summary: "1小时内重启超过5次"
-
-      - alert: FlinkBackpressure
-        expr: flink_taskmanager_job_task_busyTimeMsPerSecond > 900
-        for: 10m
-        annotations:
-          summary: "持续反压超过10分钟"
-
-      - alert: FlinkConsumerLag
-        expr: flink_taskmanager_job_task_operator_KafkaSourceReader_KafkaConsumer_records_lag_max > 100000
-        for: 5m
-        annotations:
-          summary: "Kafka 消费延迟超过10万条"
+echo "===== 巡检完成 ====="
 ```
 
 ---
 
 ## 七、举一反三
 
-### 7.1 面试高频题
+### 7.1 运维工具对比
 
-**Q1: Flink on YARN 的三种部署模式区别？**
+| 对比维度 | Flink CLI | YARN CLI | REST API | Flink Dashboard |
+|---------|----------|---------|---------|----------------|
+| 提交作业 | ✅ | ❌ | ✅ | ❌ |
+| 取消作业 | ✅ | ✅（kill） | ✅ | ✅ |
+| Savepoint | ✅ | ❌ | ✅ | ✅ |
+| 查看日志 | ❌ | ✅ | ❌ | ✅（部分） |
+| 查看指标 | ❌ | ❌ | ✅ | ✅ |
+| 批量操作 | ❌ | ✅ | ✅（脚本化） | ❌ |
+| 适用场景 | 单作业操作 | 资源管理 | 自动化运维 | 可视化监控 |
 
-> A:
-> | 模式 | JM 生命周期 | 主类执行位置 | 适用场景 |
-> |------|------------|-------------|----------|
-> | Session | 预启动，多作业共享 | Client | 开发/测试/频繁提交 |
-> | Per-Job (已废弃) | 每作业独立 | Client | 生产隔离 |
-> | Application | 每作业独立 | JM 上执行 | 生产推荐（减少Client依赖） |
+### 7.2 面试高频题
 
-**Q2: 如何实现 Flink 作业的零停机升级？**
+**Q1: Flink on YARN Application Mode 和 Per-Job Mode 有什么区别？为什么推荐 Application Mode？**
 
-> A:
-> 1. `flink stop --savepointPath` 优雅停止旧版本
-> 2. 部署新版本 JAR
-> 3. `flink run -s <savepoint-path>` 从 Savepoint 恢复新版本
-> 4. 验证新版本运行正常
-> 5. 如果异常，从同一 Savepoint 回滚到旧版本
+> **A**: 
+> - **Per-Job Mode**（已废弃）：main() 方法在客户端执行，生成 JobGraph 后提交给 YARN。客户端依赖重，需要上传 JAR 到 YARN。
+> - **Application Mode**：main() 方法在 JobManager（YARN Container）中执行。优势：
+>   1. 客户端轻量化，不需要大量资源
+>   2. JAR 可以预先放在 HDFS，避免每次提交上传
+>   3. 隔离性好，每个应用独立的 ClassLoader
+>   4. 支持一个 Application 内运行多个 Job
 
-**Q3: TM 被 YARN Kill 的常见原因和排查方法？**
+**Q2: Flink 作业在 YARN 上如何优雅升级？**
 
-> A:
-> 1. **物理内存超限**：TM 实际使用内存 > `yarn.scheduler.maximum-allocation-mb` 或 Container 申请的内存。解决：增大 `taskmanager.memory.process.size` 或增大 `jvm-overhead.fraction`
-> 2. **虚拟内存超限**：在开启 vmem-check 时，JVM 的虚拟内存很容易超限。解决：关闭 `yarn.nodemanager.vmem-check-enabled`
-> 3. **节点磁盘满**：NM 健康检查失败，杀掉所有 Container。解决：清理磁盘
+> **A**: 标准流程：
+> 1. 触发 Savepoint（`flink stop --savepointPath`）
+> 2. 等待旧 YARN Application 结束
+> 3. 上传新版本 JAR
+> 4. 从 Savepoint 恢复新版本（`flink run-application -s <savepoint-path>`）
+> 5. 验证新版本正常运行（检查 CP 是否成功、消费是否正常）
+> 6. 保留旧 Savepoint 至少 7 天作为回退点
+> 
+> 关键注意点：保持 Operator UID 不变，避免状态恢复失败。
 
-**Q4: 如何选择并行度？**
+**Q3: YARN Container 被 Kill 的常见原因和解决方案？**
 
-> A: 经验公式：
-> - Kafka Source: 并行度 = Topic Partition 数
-> - 计算算子: 并行度 = 峰值QPS / 单并行实例处理能力
-> - Sink: 并行度 = 下游写入限制（如 JDBC 连接池大小）
-> - 总的 TM 数 = max(各算子并行度) / slots per TM
+> **A**: 
+> 1. **物理内存超限**：Container 实际使用内存超过 `taskmanager.memory.process.size` → 增大 TM 内存
+> 2. **虚拟内存超限**：YARN 默认检查虚拟内存（vmem = pmem × 2.1）→ 关闭 `yarn.nodemanager.vmem-check-enabled`
+> 3. **RocksDB 堆外内存**：RocksDB 的 block cache / memtable 不受 JVM Heap 管理 → 增大 managed memory
+> 4. **用户代码内存泄漏**：JNI/DirectByteBuffer 泄漏 → 排查代码
+> 5. **YARN 资源抢占**：高优先级队列抢占低优先级 Container → 调整队列优先级
 
-### 7.2 思考题
+**Q4: 如何监控 Flink 作业的消费延迟？**
 
-1. **Flink 作业运行 30 天后突然 CP 开始失败，可能的原因有哪些？**
-2. **如何在不停止作业的情况下获取 Thread Dump 来排查性能问题？**
-3. **生产中如何实现 Flink 作业的灰度发布（同时运行新旧版本）？**
+> **A**: 多层监控：
+> 1. **Kafka Consumer Lag**：`pendingRecords` 指标，反映 Kafka 未消费消息数
+> 2. **Event Time Watermark**：`currentInputWatermark` 与当前时间的差值，反映事件时间处理延迟
+> 3. **处理延迟**：`latency.source_id.operator_id.operator_subtask_index.latency_max`
+> 4. **Checkpoint 指标**：CP 耗时增加通常意味着吞吐下降
+> 
+> 告警规则：Kafka Lag >10万 或 Watermark 延迟 >5分钟 或 CP 持续失败 → 触发告警
 
----
+### 7.3 思考题
 
-## 附录：常用命令速查
+1. **自动化运维题**：设计一个 Flink 作业自动化运维平台，需要支持：一键提交/升级/扩缩容、自动故障恢复（从最近 CP 恢复）、资源弹性伸缩。请画出架构图并说明核心模块。
 
-```bash
-# 提交
-flink run-application -t yarn-application -c <class> <jar>
+2. **容灾设计题**：公司有两个数据中心（北京和上海），需要设计 Flink 作业的跨机房容灾方案。当北京机房故障时，上海机房的 Flink 作业能在 5 分钟内接管。请设计方案。
 
-# 查看
-yarn application -list -appTypes APACHE_FLINK
-flink list -yid <app-id>
-
-# 停止（带SP）
-flink stop --savepointPath hdfs:///flink/savepoints/ <job-id> -yid <app-id>
-
-# 取消
-flink cancel <job-id> -yid <app-id>
-
-# 恢复
-flink run-application -t yarn-application -s <sp-path> -c <class> <jar>
-
-# Savepoint
-flink savepoint <job-id> <target-dir> -yid <app-id>
-
-# 日志
-yarn logs -applicationId <app-id>
-yarn logs -applicationId <app-id> -containerId <container-id>
-
-# 强杀
-yarn application -kill <app-id>
-```
+3. **成本优化题**：团队有 50+ 个 Flink 作业运行在 YARN 上，总资源占用 500 个 Container。经分析发现 60% 的作业 CPU 利用率不到 20%。如何优化资源利用率同时保证作业稳定性？
 
 ---
 
-**本教案结束。8 篇 Flink on YARN 使用姿势教案全部完成。**
+> 📝 **本教案配套资源**
+> - 升级脚本模板: `scripts/upgrade-flink-job.sh`
+> - 日常巡检脚本: `scripts/daily-check.sh`
+> - Prometheus 配置: `monitoring/prometheus-flink.yml`
+> - Grafana Dashboard: `monitoring/flink-ops-dashboard.json`
+> - AlertManager 规则: `monitoring/flink-alert-rules.yml`
