@@ -10,10 +10,13 @@
 
 | 序号 | 文档 | 内容 | 适用角色 |
 |------|------|------|---------|
+| **00** | [**LDAP 核心概念入门**](./00-LDAP核心概念入门.md) | **零基础必读**：DIT/DN/属性/Schema/LDIF/bind/search/ACL 全套术语+类比 | **新人 / 跨界** |
 | 01 | [LDAP 搭建手册](./01-LDAP搭建手册.md) | 从 0 到 1 部署 OpenLDAP/389-DS、目录设计、TLS、MMR、HA | SRE 部署 |
 | 02 | [LDAP 与大数据组件集成](./02-LDAP与大数据组件集成.md) | HDFS/YARN/Hive/Kyuubi/Trino/Impala/Ranger/Knox/Hue/Ambari/CM 全配置 | 平台工程师 |
 | 03 | [LDAP 日常运维手册](./03-LDAP日常运维手册.md) | 用户/组管理、ppolicy、ACL、备份、监控、调优、灾难演练 | Day 2 运维 |
 | 04 | [LDAP 常见问题排障](./04-LDAP常见问题排障.md) | 30+ 真实 Case，按错误码/场景分类 | 应急排障 |
+
+> 💡 **零基础读者请务必先看 00**：30 分钟搞懂 LDAP 全部术语，再读 01~04 不再费解。
 
 ---
 
@@ -23,6 +26,11 @@
 
 | 场景 | 直达章节 |
 |------|---------|
+| **完全没接触过 LDAP，啥都不懂** | **00-§ 全篇（必看）** |
+| 看不懂 DN / OU / objectClass 是啥 | 00-§2~§6 |
+| filter 语法 `(&(...)(...))` 看着头大 | 00-§9 search 与 filter |
+| 不知道 posixGroup 和 groupOfNames 选哪个 | 00-§10 用户和组 |
+| 想看完整的"alice 登录 Hive"流程 | 00-§14 串起来 |
 | 新建一套 LDAP | 01-§2 OpenLDAP 单机搭建 |
 | 让多套 LDAP 互为主备 | 01-§4 主主复制 MMR |
 | 给集群加 LDAP 认证 | 02-§3 HS2 / §4 Kyuubi / §5 Trino |
@@ -226,7 +234,8 @@ ldap/
 │   ├── slapd-启动流程.md
 │   ├── syncrepl-复制机制.md
 │   └── mdb-后端原理.md
-├── 案例/                           ← 本手册（5 篇）
+├── 案例/                           ← 本手册（6 篇）
+│   ├── 00-LDAP核心概念入门.md       ← 零基础必读
 │   ├── 01-LDAP搭建手册.md
 │   ├── 02-LDAP与大数据组件集成.md
 │   ├── 03-LDAP日常运维手册.md
