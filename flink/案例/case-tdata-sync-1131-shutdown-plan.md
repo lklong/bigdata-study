@@ -11,21 +11,21 @@
 
 ## 0. TL;DR（30 秒决策）
 
-> **这是一个 Flink 1.13.1 的数据同步作业，不能走 HA 自恢复路径，必须 Savepoint。** 直接关机会踩到 FLINK-22483 / 22646 / 23456 三个已知 Bug 中的一个。
+> **这是一个 Flink 1.13.1 的数据同步作业，建议走 Savepoint 路径。** 直接关机可能踩到 FLINK-22483 / 22646 / 23456 三个已知 Bug 中的一个。
 >
-> **🔴 更糟的是**：`yarn.application-attempts=0` + `yarn.resourcemanager.am.max-attempts=0`，**HA 容灾能力基本失效**（详见 § 2.3）。**绝对禁止**依赖 HA 自恢复。
+> **🟡 参数疑点**：`yarn.application-attempts=0` + `yarn.resourcemanager.am.max-attempts=0`，**不等同于 HA 失效**（经源码审查，RM 会自动回退到集群 yarn-site.xml 配置），**但需通过 RM REST API 实测 maxAppAttempts 实际生效值**（详见 § 2.3）。
 >
 > **🟡 且**：这是 **DP 平台托管**作业（`dp-beaver-master-QF64y0ti.jar`），**必须通过平台操作**，不能直接动 YARN（详见 § 2.4）。
 
 **执行顺序**：
 
 ```
-① 预检（5min，含 max-attempts 验证）
+① 预检（5min，含 maxAppAttempts 实测）
 ② 【协调 DP 平台】暂停自动拉起
 ③ 【通过平台】Savepoint + 停止作业
 ④ 隔离调度（refreshNodes 不加 -g）
 ⑤ 停 NM → 关机
-⑥ 节点上线后【通过平台】从 SP 恢复（先改 application-attempts=10）
+⑥ 节点上线后【通过平台】从 SP 恢复（建议平台侧修正 application-attempts 默认值）
 ```
 
 ---
@@ -78,53 +78,90 @@
 | 可观测性 | 低（Failover 过程不透明）| 高（SP 路径可见）|
 | 回滚难度 | 难（HA 元数据已被新 AM 覆盖）| 容易（SP 文件保留）|
 
-### 2.3 🔴 额外致命项：AM 重试配置失效
+### 2.3 AM 重试配置疑点（需实测验证，非直接风险）
 
 ```properties
-yarn.application-attempts                = 0     ⚠️ 字面值为 0
-yarn.resourcemanager.am.max-attempts     = 0     ⚠️ RM 级别上限也为 0
+yarn.application-attempts                = 0     ← 作业侧配置
+yarn.resourcemanager.am.max-attempts     = 0     ← 在 Flink 侧出现不代表生效
 ```
 
-**影响分析**：
+**⚠️ 源码级澄清（避免误判）**：
 
-HA 机制依赖链：`AM 挂 → YARN 重拉新 Attempt → 新 AM 从 ZK/HA 存储恢复 → 作业继续`
+经源码审查（Flink `release-1.13` + Hadoop `emr-3.2.2`），这两个值**不等于** "HA 失效"：
 
-如果 `max-attempts = 0` 被严格解释：
-- **AM 挂了就彻底 FAILED**，YARN 不会拉新 Attempt
-- 配置里的 `high-availability=zookeeper` 完全用不上
-- **HA 链路第一环就断了**
+**1. Flink 客户端行为** (`YarnClusterDescriptor.java:816-828`)：
 
-如果被当作"用集群默认值"处理（部分版本会）：
-- 回退到默认 2（或集群设定值），比合理配置（10）差很多
-- 稍微多几次 Failover 就触顶，作业永久 FAILED
+```java
+if (HighAvailabilityMode.isHighAvailabilityModeActivated(configuration)) {
+    appContext.setMaxAppAttempts(
+        configuration.getInteger(
+            YarnConfigOptions.APPLICATION_ATTEMPTS.key(),
+            YarnConfiguration.DEFAULT_RM_AM_MAX_ATTEMPTS));  // 默认 2
+    activateHighAvailabilitySupport(appContext);
+} else {
+    appContext.setMaxAppAttempts(
+        configuration.getInteger(YarnConfigOptions.APPLICATION_ATTEMPTS.key(), 1));
+}
+```
 
-**结论**：无论哪种解读，**不能依赖 HA 自恢复**，必须走 Savepoint 路径。
+- 作业侧配 `application-attempts=0` → 原样透传到 `setMaxAppAttempts(0)`
+- **`yarn.resourcemanager.am.max-attempts` Flink 压根不读**，在 Flink 侧配也不会传给 RM
 
-**紧急验证方法**：
+**2. Hadoop RM 的处理** (`RMAppImpl.java:457-478`)：
+
+```java
+int rmMaxAppAttempts = conf.getInt(
+    YarnConfiguration.RM_AM_MAX_ATTEMPTS,
+    YarnConfiguration.DEFAULT_RM_AM_MAX_ATTEMPTS);  // 2
+int individualMaxAppAttempts = submissionContext.getMaxAppAttempts();  // 作业给的 0
+if (individualMaxAppAttempts <= 0) {
+    this.maxAppAttempts = rmMaxAppAttempts;   // ★ 回退到 RM 侧配置
+    LOG.warn("...is invalid...Use the rm max attempts instead.");
+}
+```
+
+- 作业侧 `<=0` → **RM 会自动回退到集群 yarn-site.xml 里的 `yarn.resourcemanager.am.max-attempts` 值**
+- 如果 **集群侧** 配了合理值（如默认 2 或运维配的 10）→ 实际生效值合理 → **HA 正常工作**
+- 只有在 **集群侧也是 0** 的罕见情况下，才会真的 `maxAppAttempts=0`
+
+**3. RM 的 AM 失败判定** (`RMAppImpl.java:1563`)：
+
+```java
+if (!app.submissionContext.getUnmanagedAM()
+    && numberOfFailure < app.maxAppAttempts) {
+    // 重试
+}
+```
+
+- 只有 `maxAppAttempts=0 或 1` 时，AM 失败才不会重试
+
+**🔍 必须实测验证（强制步骤）**：
 
 ```bash
+# ✅ 唯一可信的方法：查 RM 实际给作业分配的 maxAppAttempts
 APP_ID=application_1763473707704_1214
-
-# 方法 1：RM REST API 看实际生效值（最准）
 curl -s "http://<rm-host>:8088/ws/v1/cluster/apps/$APP_ID" | \
-  python -m json.tool | grep -iE "maxAppAttempts"
+  python -m json.tool | grep -i maxAppAttempts
 
-# 方法 2：yarn 命令看已用次数
-yarn applicationattempt -list $APP_ID
-
-# 方法 3：RM 日志
-grep "$APP_ID" /var/log/hadoop-yarn/yarn-*-resourcemanager-*.log | \
-  grep -iE "maxAppAttempts" | head
+# 结果解读：
+# "maxAppAttempts": 10   → HA 正常，可以依赖自恢复
+# "maxAppAttempts": 2    → HA 能工作但次数少，建议 Savepoint
+# "maxAppAttempts": 1    → ⚠️ 真的有风险，必须 Savepoint
+# "maxAppAttempts": 0    → 🔴 作业无法正常运行（理论上不会出现，若出现说明有 Bug）
 ```
 
-**配置修复建议**（恢复作业前必做）：
+**结论**：Flink Web UI 显示的这两个 0 **本身不是直接证据**，只是"作业侧配了个无效值，被 RM 兜底了"。**真正的风险等级取决于集群 yarn-site.xml 配置**。
 
-```yaml
-# 作业侧 flink-conf.yaml 或 -D 参数
-yarn.application-attempts: 10
-# yarn.resourcemanager.am.max-attempts 不建议在作业侧覆盖，让它用集群默认
-# 如果必须设，应 >= 10
-```
+---
+
+**🟡 但这并不改变"必须走 Savepoint"的最终建议**，理由是：
+
+1. 1.13.1 的 CK Bug 独立存在，和 max-attempts 无关
+2. COS HA 存储的延迟/一致性风险独立存在
+3. DP 平台托管的自动拉起干扰独立存在
+4. 即使 RM 侧 maxAppAttempts=10，遇到 1.13 的 CK 元数据损坏 Bug 照样恢复失败
+
+Savepoint 是针对**整个风险组合**的最保险方案。
 
 ### 2.4 🟡 额外项：DP 平台托管作业
 
@@ -568,3 +605,4 @@ flink run -m yarn-cluster -s <sp_path> -d /path/to/jar
 |---|---|---|---|
 | v1.0 | 2026-05-11 | eric | 初版，基于 1.13.1 的 HA/CK Bug 专项设计 |
 | v1.1 | 2026-05-11 | eric | 新增 §2.3 `max-attempts=0` 致命配置分析 + §2.4 DP 平台托管操作规范；更新执行步骤和恢复流程 |
+| v1.2 | 2026-05-11 | eric | **重要修正**：经 Flink `release-1.13` + Hadoop `emr-3.2.2` 源码审查（Challenger 机制），§2.3 结论从"HA 失效"修正为"需实测验证"。实证依据：`RMAppImpl.java:457-478` 会把 `<=0` 回退到集群 yarn-site.xml，`YarnClusterDescriptor.java:816-828` 证实 Flink 只透传 `application-attempts` 不处理 `am.max-attempts`。 |

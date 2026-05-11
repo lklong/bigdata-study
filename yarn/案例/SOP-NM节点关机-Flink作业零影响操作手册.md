@@ -365,8 +365,8 @@ restart-strategy.exponential-delay.reset-backoff-threshold: 10min
 | HA 存储用 COS 未验证 | 恢复时 CK 元数据读不到，作业 FAILED | 步骤 2.3 必查 `_metadata` |
 | ZK ACL=open 被误删 | 恢复时 `/flink/<cluster-id>` 不存在 | 改 `creator` + SASL |
 | `yarn.application-attempts` 已用完 | 再失败一次作业就彻底死 | 步骤 2.2 查 Attempt 编号 |
-| **`yarn.application-attempts=0`** 🔴 | **AM 挂了不重试，HA 完全失效**；作业 FAILED 后不会自动恢复 | 关机前必查，实际值应 >= 5，推荐 10 |
-| `yarn.resourcemanager.am.max-attempts=0` 🔴 | RM 侧限死重试上限，application-attempts 失效 | 作业侧不要设，让它用集群默认；必设也要 >= 10 |
+| `yarn.application-attempts=0`（作业侧） | **RM 会回退到集群 yarn-site.xml 的 `yarn.resourcemanager.am.max-attempts`**（源码 `RMAppImpl.java:464`），不等于 HA 失效；但需实测 RM 生效值 | `curl http://<rm>:8088/ws/v1/cluster/apps/<appid> \| grep maxAppAttempts` |
+| `yarn.resourcemanager.am.max-attempts=0`（作业侧） | Flink 不读此参数，配在作业侧无效；真正生效值看 RM 端 yarn-site.xml | 检查 `/etc/hadoop/conf/yarn-site.xml` 的 RM 配置 |
 | DP/数据平台托管作业被手动 kill | 平台状态不一致，可能自动重提新 AppID 干扰流程 | 操作前先通过平台暂停自动拉起 |
 | 批量关机超过集群容量 | 作业申请不到 TM，卡 SCHEDULED | 步骤 2.1 算剩余资源 |
 | JM 和多 TM 同节点 | 节点关机=双重故障 | 提前用 node label 做反亲和 |
@@ -517,3 +517,4 @@ yarn application -status <app_id> | grep -oE "flink[0-9]+"
 | v1.0 | 2026-05-11 | eric | 初版，整合 NM 关机 + Flink HA + Savepoint 完整流程 |
 | v1.1 | 2026-05-11 | eric | 新增 §8 Flink 版本差异注意事项，专项覆盖 1.13.x 风险 |
 | v1.2 | 2026-05-11 | eric | §6 常见坑补充 `application-attempts=0` / `max-attempts=0` 陷阱 + DP 平台托管作业操作规范 |
+| v1.3 | 2026-05-11 | eric | **源码级修正**：§6 中关于 `application-attempts=0` 的描述从"AM 不重试 HA 失效"修正为"RM 会回退到 yarn-site.xml"。依据 Flink `release-1.13` + Hadoop `emr-3.2.2` 源码实证（Challenger 审查机制）。 |
