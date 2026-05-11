@@ -12,13 +12,20 @@
 ## 0. TL;DR（30 秒决策）
 
 > **这是一个 Flink 1.13.1 的数据同步作业，不能走 HA 自恢复路径，必须 Savepoint。** 直接关机会踩到 FLINK-22483 / 22646 / 23456 三个已知 Bug 中的一个。
+>
+> **🔴 更糟的是**：`yarn.application-attempts=0` + `yarn.resourcemanager.am.max-attempts=0`，**HA 容灾能力基本失效**（详见 § 2.3）。**绝对禁止**依赖 HA 自恢复。
+>
+> **🟡 且**：这是 **DP 平台托管**作业（`dp-beaver-master-QF64y0ti.jar`），**必须通过平台操作**，不能直接动 YARN（详见 § 2.4）。
 
 **执行顺序**：
 
 ```
-① 预检（5min）  →  ② Savepoint（3~10min）  →  ③ 隔离调度  →  ④ 停 NM  →  ⑤ 关机
-                                      ↓
-                                ⑥ 节点上线后从 SP 恢复（建议同时升级到 1.13.6+）
+① 预检（5min，含 max-attempts 验证）
+② 【协调 DP 平台】暂停自动拉起
+③ 【通过平台】Savepoint + 停止作业
+④ 隔离调度（refreshNodes 不加 -g）
+⑤ 停 NM → 关机
+⑥ 节点上线后【通过平台】从 SP 恢复（先改 application-attempts=10）
 ```
 
 ---
@@ -33,6 +40,11 @@
 | HA 类型 | ZooKeeper | quorum: `10.117.201.59:2181, .39:2181, .111:2181` |
 | HA 存储 | COS（`cosn://`） | 最终一致性 + 延迟比 HDFS 高 |
 | ZK ACL | `open` ⚠️ | 安全隐患，任何人可改 HA 元数据 |
+| 作业名 | `dp-beaver-master-QF64y0ti.jar` | **DP 数据平台托管**，带平台 Task ID |
+| 队列 | `beaver` | |
+| **AM 重试** | `yarn.application-attempts = 0` ⚠️🔴 | **HA 容灾能力基本失效**，详见 § 2.3 |
+| **RM 重试上限** | `yarn.resourcemanager.am.max-attempts = 0` ⚠️🔴 | 同上 |
+| 失败窗口 | `attempt-failures-validity-interval = 600000`（10min）| ✅ 合理 |
 | 作业语义 | tdata_sync（数据同步） | 对数据一致性敏感，丢/重数据影响大 |
 
 ---
@@ -66,6 +78,67 @@
 | 可观测性 | 低（Failover 过程不透明）| 高（SP 路径可见）|
 | 回滚难度 | 难（HA 元数据已被新 AM 覆盖）| 容易（SP 文件保留）|
 
+### 2.3 🔴 额外致命项：AM 重试配置失效
+
+```properties
+yarn.application-attempts                = 0     ⚠️ 字面值为 0
+yarn.resourcemanager.am.max-attempts     = 0     ⚠️ RM 级别上限也为 0
+```
+
+**影响分析**：
+
+HA 机制依赖链：`AM 挂 → YARN 重拉新 Attempt → 新 AM 从 ZK/HA 存储恢复 → 作业继续`
+
+如果 `max-attempts = 0` 被严格解释：
+- **AM 挂了就彻底 FAILED**，YARN 不会拉新 Attempt
+- 配置里的 `high-availability=zookeeper` 完全用不上
+- **HA 链路第一环就断了**
+
+如果被当作"用集群默认值"处理（部分版本会）：
+- 回退到默认 2（或集群设定值），比合理配置（10）差很多
+- 稍微多几次 Failover 就触顶，作业永久 FAILED
+
+**结论**：无论哪种解读，**不能依赖 HA 自恢复**，必须走 Savepoint 路径。
+
+**紧急验证方法**：
+
+```bash
+APP_ID=application_1763473707704_1214
+
+# 方法 1：RM REST API 看实际生效值（最准）
+curl -s "http://<rm-host>:8088/ws/v1/cluster/apps/$APP_ID" | \
+  python -m json.tool | grep -iE "maxAppAttempts"
+
+# 方法 2：yarn 命令看已用次数
+yarn applicationattempt -list $APP_ID
+
+# 方法 3：RM 日志
+grep "$APP_ID" /var/log/hadoop-yarn/yarn-*-resourcemanager-*.log | \
+  grep -iE "maxAppAttempts" | head
+```
+
+**配置修复建议**（恢复作业前必做）：
+
+```yaml
+# 作业侧 flink-conf.yaml 或 -D 参数
+yarn.application-attempts: 10
+# yarn.resourcemanager.am.max-attempts 不建议在作业侧覆盖，让它用集群默认
+# 如果必须设，应 >= 10
+```
+
+### 2.4 🟡 额外项：DP 平台托管作业
+
+作业名 `dp-beaver-master-QF64y0ti.jar` 显示这是 **DP 数据平台**托管的作业：
+- `QF64y0ti` 是平台生成的 Task ID
+- 平台侧可能有**自动拉起策略**（作业 FAILED 自动重提）
+- 直接 `yarn application -kill` 会导致平台状态不一致
+
+**操作规范**：
+1. **必须通过 DP 平台界面操作**，不要直接动 YARN
+2. 关机窗口期前，在平台侧**暂停自动拉起**
+3. 平台确认作业已停 + 不会自动拉起 → 再动 NM
+4. 恢复时也走平台，不要 `flink run` 手工提交（会脱管）
+
 ---
 
 ## 3. 预检清单（必做）
@@ -90,6 +163,13 @@ yarn applicationattempt -list $APP_ID
 LATEST_ATTEMPT=$(yarn applicationattempt -list $APP_ID | grep -oE "appattempt_[0-9_]+" | tail -1)
 yarn container -list $LATEST_ATTEMPT
 # 对比 LOG-URL 里的 host 和待关机节点列表
+
+# [5] 🔴 实际生效的 AM 最大重试次数（本作业特别重要）
+RM_HOST=<your-rm-host>
+curl -s "http://$RM_HOST:8088/ws/v1/cluster/apps/$APP_ID" | \
+  python -m json.tool | grep -iE "maxAppAttempts"
+# 如果返回 0 或 1 → ⚠️ 必须走 Savepoint，禁止任何可能触发 AM 重启的操作
+# 如果返回 >= 5 → 相对安全，但仍建议走 Savepoint
 ```
 
 ### 3.2 Checkpoint 健康检查（1.13 专项）
@@ -173,20 +253,30 @@ hadoop fs -ls cosn://.../flink1131/tdata_sync/ha/ | grep "application_" | wc -l
 
 ## 4. 执行步骤
 
-### 4.1 Step 1：做 Savepoint（核心操作）
+### 4.1 Step 1：【通过 DP 平台】暂停自动拉起 + 做 Savepoint
+
+**⚠️ 重要**：这是 DP 平台托管作业，以下操作**优先走平台界面**，以下 Shell 命令作为"平台能力不支持时的兜底"。
+
+```
+DP 平台侧操作流程（示意，具体按平台 UI）：
+  a) 进入 tdata_sync 任务详情页
+  b) 点击 "暂停" / "停止调度"，阻止平台自动重提
+  c) 触发 "Savepoint & Stop" 操作
+  d) 等待任务状态变为 "已停止" + SP 路径显示
+  e) 记录 SP 路径（后面恢复要用）
+```
+
+**兜底 Shell 命令**（仅在平台界面不可用时使用，且需事先通知平台方）：
 
 ```bash
 APP_ID=application_1763473707704_1214
 SP_DIR=cosn://zt-bigdata-emr-online-1256037416/tools/flink1131/tdata_sync/savepoints/
 
-# [1] 拿 Flink JobID
+# [a] 拿 Flink JobID
 flink list -yid $APP_ID
-# 输出形如：
-#   Running/Restarting Jobs
-#   01.05.2026 10:00:00 : abcdef123456 : tdata_sync_job (RUNNING)
-FLINK_JOB_ID=<从上面复制>
+FLINK_JOB_ID=<从输出复制>
 
-# [2] 触发 stop-with-savepoint
+# [b] 触发 stop-with-savepoint
 # ⚠️ 1.13 推荐用 -p 简写；不要加 --drain（1.13 有 Bug）
 flink stop \
   -p $SP_DIR \
@@ -196,15 +286,28 @@ flink stop \
 # 成功输出：
 #   Savepoint completed. Path: cosn://.../savepoints/savepoint-abcdef-xxxxx
 
-# [3] ⚠️ 如果 flink stop 卡超过 10 分钟 → 兜底方案
-# 不要 Ctrl+C，在另一终端执行：
+# [c] ⚠️ 如果 flink stop 卡超过 10 分钟 → 兜底方案
 flink cancel -s $SP_DIR -yid $APP_ID $FLINK_JOB_ID
-# cancel -s 在 1.13.1 仍可用，语义：触发 SP 后 cancel
-# 差异：不 drain Watermark，下游可能收到少量延迟数据（tdata_sync 场景通常可接受）
 
-# [4] 记录 SP 路径！
+# [d] 记录 SP 路径！
 SP_PATH=cosn://.../savepoints/savepoint-abcdef-xxxxx
 echo "[$(date)] tdata_sync_1131 $APP_ID -> $SP_PATH" >> /tmp/flink_savepoints.log
+```
+
+**🔴 绝对禁止的操作**（会触发 `max-attempts=0` 陷阱）：
+
+```bash
+# ❌ 禁止：直接 kill 作业
+yarn application -kill $APP_ID
+# 后果：作业 FAILED，max-attempts=0 下 HA 不会拉起；
+#       DP 平台可能自动重提一个新 AppID，造成状态混乱
+
+# ❌ 禁止：kill AM Attempt 期待 HA 恢复
+yarn applicationattempt -fail <attempt_id>
+# 后果：max-attempts=0 下 AM 不会重启，作业直接 FAILED
+
+# ❌ 禁止：直接让 AM 所在节点关机（没做 SP 的情况下）
+# 后果：AM 进程消失 → 等超时 → YARN 不会重拉（max-attempts=0）→ 作业死
 ```
 
 ### 4.2 Step 2：验证 Savepoint 完整性
@@ -276,29 +379,43 @@ yarn rmadmin -refreshNodes
 for h in $NM_HOSTS; do
   ssh $h "sudo systemctl start hadoop-yarn-nodemanager"
 done
+```
 
-# [3] 从 SP 恢复作业
-# ⚠️ 1.13 用 flink run（不是 run-application）+ -m yarn-cluster
+**[3] 恢复作业 —— 必须先修 `application-attempts` 配置！**
+
+```
+❗ 恢复前必做：把 yarn.application-attempts 从 0 改为 10
+   - 如是 DP 平台托管：在平台任务配置里修改
+   - 如手工提交：在 flink-conf.yaml 或启动命令 -D 里设置
+```
+
+**DP 平台恢复（推荐）**：
+```
+a) 在平台任务配置里修改：
+     yarn.application-attempts = 10
+     (yarn.resourcemanager.am.max-attempts 留空，用集群默认)
+b) 指定 "从 Savepoint 启动" + 填入 SP 路径
+c) 恢复自动拉起开关
+d) 启动任务
+```
+
+**手工兜底恢复**（仅平台不可用时）：
+
+```bash
 SP_PATH=<上面记录的 SP 路径>
 
+# ⚠️ 1.13 用 flink run（不是 run-application）+ -m yarn-cluster
 flink run \
   -m yarn-cluster \
   -ynm tdata_sync_1131 \
-  -yqu <queue_name> \
+  -yqu beaver \
   -yjm 2048 \
   -ytm 4096 \
   -ys 2 \
   -d \
   -s $SP_PATH \
+  -Dyarn.application-attempts=10 \
   /path/to/tdata_sync.jar <作业参数>
-
-# 或如果用 Application Mode：
-flink run-application \
-  -t yarn-application \
-  -Dyarn.application.name=tdata_sync_1131 \
-  -Dparallelism.default=8 \
-  -s $SP_PATH \
-  /path/to/tdata_sync.jar
 ```
 
 ### 4.6 Step 6：恢复后验证
@@ -337,6 +454,12 @@ hadoop fs -rm -r -skipTrash \
 ### 5.2 加固配置（写入作业 `flink-conf.yaml`）
 
 ```yaml
+# 🔴 致命配置修正（本作业当前 = 0，必改）
+yarn.application-attempts: 10
+# yarn.resourcemanager.am.max-attempts 不建议作业侧覆盖
+#   若要设置，应 >= 10，不能为 0
+yarn.application-attempt-failures-validity-interval: 600000   # 已是合理值
+
 # 关键参数修正
 high-availability.zookeeper.client.acl: creator       # ⚠️ 从 open 改为 creator
 zookeeper.sasl.disable: false                          # 配合启用 SASL
@@ -347,10 +470,6 @@ state.backend.rocksdb.checkpoint.transfer.thread.num: 4   # COS 多线程上传
 
 # TM 复用（1.13 收益有限但有胜于无）
 resourcemanager.taskmanager-timeout: 120000
-
-# AM 重试
-yarn.application-attempts: 10
-yarn.application-attempt-failures-validity-interval: 600000
 
 # 心跳
 heartbeat.timeout: 120000
@@ -448,3 +567,4 @@ flink run -m yarn-cluster -s <sp_path> -d /path/to/jar
 | 版本 | 日期 | 作者 | 变更说明 |
 |---|---|---|---|
 | v1.0 | 2026-05-11 | eric | 初版，基于 1.13.1 的 HA/CK Bug 专项设计 |
+| v1.1 | 2026-05-11 | eric | 新增 §2.3 `max-attempts=0` 致命配置分析 + §2.4 DP 平台托管操作规范；更新执行步骤和恢复流程 |
