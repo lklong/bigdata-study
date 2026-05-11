@@ -416,8 +416,100 @@ echo "=== 结论 ==="
 
 ---
 
-## 8. 变更记录
+## 8. Flink 版本差异注意事项（重要）
+
+关机 SOP 的"标准流程"基于 **Flink 1.17+ 的行为**，但生产环境常有 1.13 / 1.14 等老版本作业，行为差异显著。本章列出高频差异点。
+
+### 8.1 关键能力版本矩阵
+
+| 能力 | 1.13.x | 1.14.x | 1.15.x | 1.17+ | 1.19+ |
+|---|---|---|---|---|---|
+| TM 复用（JM 切换时老 TM 重注册） | ⚠️ 不稳定 | ⚠️ 改进中 | ✅ 稳定 | ✅ 稳定 | ✅ 稳定 |
+| `resourcemanager.taskmanager-timeout` 生效 | ⚠️ 打折 | ✅ | ✅ | ✅ | ✅ |
+| Unaligned Checkpoint | 🧪 实验 | ✅ | ✅ | ✅ | ✅ |
+| Reactive Mode / Adaptive Scheduler | ❌ | 🧪 | ✅ | ✅ | ✅ |
+| Application Mode 稳定性 | 🧪 | ✅ | ✅ | ✅ | ✅ |
+| KafkaSource（新版） | ❌（用 FlinkKafkaConsumer）| 🧪 | ✅ | ✅ | ✅ |
+| `flink stop --drain` | ⚠️ 有 Bug | ✅ | ✅ | ✅ | ✅ |
+| Savepoint 格式兼容 | v2 | v2 | v3（兼容 v2）| v3 | v3 |
+
+### 8.2 Flink 1.13.x 专项风险
+
+**1.13 是已知"稳定性过渡版本"，关机/恢复场景下有多个 Bug**，建议优先走 Savepoint 路径，不要依赖 HA 自恢复。
+
+| Bug/限制 | 影响 | 规避 |
+|---|---|---|
+| **FLINK-22483** — CK 超时后状态不一致 | 恢复时数据重复或丢失 | 关机前必须等一次完整 CK 成功，`tolerable-failed-checkpoints=0` |
+| **FLINK-22646** — RocksDB 增量 CK 元数据损坏 | 从 CK 恢复直接 FAILED | 关机前做 Savepoint（全量），不依赖增量 CK |
+| **FLINK-23456** — HA 路径清理不彻底 | 僵尸 HA 目录累积，拖慢恢复 | 定期清理 `storageDir` 下历史 `application_xxx/` 目录 |
+| **TM 复用不稳定** | JM 切换时老 TM 全部重建，恢复慢 2~3 倍 | JM 所在节点关机前主动 Savepoint，不靠 AM Retry |
+| **`flink stop --drain` Bug** | Drain 不彻底，Watermark 推进异常 | 用 `flink stop -p`（不加 --drain），或 `flink cancel -s` 兜底 |
+| **FlinkKafkaConsumer offset 语义** | CK 之外有窗口期 offset 已 commit 到 Kafka | 下游幂等消费，不要完全信任 EXACTLY_ONCE |
+
+**1.13.x 关机前额外检查清单**：
+
+```bash
+APP_ID=application_xxxxx
+
+# 1) 确认最近 CK 真的 Completed（不只是文件存在）
+yarn logs -applicationId $APP_ID -log_files jobmanager.log | \
+  grep -E "Completed checkpoint|Checkpoint.*failed" | tail -20
+
+# 2) 检查 RocksDB 增量 CK 警告
+yarn logs -applicationId $APP_ID -log_files jobmanager.log | \
+  grep -iE "incremental|rocksdb.*warn|state.*corrupt" | tail -20
+
+# 3) 检查 Backpressure（1.13 在背压下 CK 超时率高）
+# Flink Web UI → Job → Backpressure
+# HIGH/SEVERE 必须先缓解
+
+# 4) 检查 HA 僵尸目录
+hadoop fs -ls <storageDir> | wc -l
+# 超过 50 个 → 清理历史 application_xxx/
+```
+
+### 8.3 不同版本的推荐处置路径
+
+| Flink 版本 | 关机时推荐路径 | 原因 |
+|---|---|---|
+| 1.13.x | **强制路径 A（Savepoint）** | HA 恢复 Bug 多，不能冒险 |
+| 1.14.x | 路径 A 优先，路径 B 可接受 | 大部分 Bug 已修，但 TM 复用仍不够稳 |
+| 1.15.x | 路径 A/B 均可 | TM 复用稳定 |
+| 1.17+ | 路径 B（HA 自恢复）可作为默认 | 全特性成熟 |
+
+### 8.4 版本识别方法
+
+```bash
+# 从作业本身识别
+flink --version
+
+# 从 YARN 应用识别（如果走命名规范）
+yarn application -status <app_id> | grep -oE "flink[0-9]+"
+# 常见规范：flink1131 = 1.13.1，flink1190 = 1.19.0
+
+# 从 HA storageDir 路径识别（如果路径有版本号约定）
+# 例：cosn://.../tools/flink1131/... → 1.13.1
+
+# 从 Flink Web UI 右上角
+```
+
+### 8.5 升级建议
+
+对仍在使用 1.13/1.14 的作业，建议推动升级：
+
+| 升级路径 | 成本 | 收益 | 建议窗口 |
+|---|---|---|---|
+| 1.13.x → 1.13.6 | 极低（仅 patch）| 修复已知 Bug | 任意 CK 后 |
+| 1.13.x → 1.14.6 | 低 | 更稳定 CK | 季度维护 |
+| 1.13.x → 1.17/1.19 | 中（Source/Sink API 迁移）| 长期一致 | 大版本维护窗口 |
+
+**黄金组合**：NM 关机维护窗口 + Flink 版本升级，一次停机同时完成。
+
+---
+
+## 9. 变更记录
 
 | 版本 | 日期 | 作者 | 变更说明 |
 |---|---|---|---|
 | v1.0 | 2026-05-11 | eric | 初版，整合 NM 关机 + Flink HA + Savepoint 完整流程 |
+| v1.1 | 2026-05-11 | eric | 新增 §8 Flink 版本差异注意事项，专项覆盖 1.13.x 风险 |
