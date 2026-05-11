@@ -183,24 +183,34 @@ RM 分支:  <=0 → 回退到 rmMaxAppAttempts = 10
 日志:     WARN "max attempts ... is invalid ... Use the rm max attempts instead"
 ```
 
-### 场景 B：作业侧 `application-attempts=0`，RM 侧 `am.max-attempts=未配置`（⭐ 生产常见）
+### 场景 B：作业侧 `application-attempts=0`，RM 侧 `am.max-attempts` 和 `global.max-attempts` 均未配置（⭐ 本次实证案例）
 
 ```
 Flink:    setMaxAppAttempts(0) 透传
 RM 收到:  individualMaxAppAttempts = 0
-RM 分支:  <=0 → 回退到 rmMaxAppAttempts = DEFAULT_RM_AM_MAX_ATTEMPTS = 2
-最终:     maxAppAttempts = 2  ✅ HA 可工作，但只重试 1 次
+RM 读取:  rmMaxAppAttempts = conf.getInt(RM_AM_MAX_ATTEMPTS, DEFAULT=2) = 2
+RM 分支:  <=0 → 回退到 rmMaxAppAttempts
+最终:     maxAppAttempts = 2  ✅ HA 可工作，AM 允许失败 1 次（第 2 次失败则 FAILED）
 ```
 
-**⭐ 真实案例**：某 DP 平台托管的 Flink 1.13.1 数据同步作业：
-- 作业侧：`application-attempts=0` + `am.max-attempts=0`（后者 Flink 不读，实际无效）
-- 集群：`yarn.resourcemanager.am.global.max-attempts` 未配置
-- 作业稳定运行 **30 天+**
+**⭐ 真实案例**（经 eric + 用户 2026-05-11 多轮源码审查确认）：
 
-反推：
-- AM 第一次必须能启动 → `maxAppAttempts >= 1`
-- 结合集群未额外配置 → `maxAppAttempts = 2`（默认值）
-- HA 是工作的，但只允许 AM 失败 1 次就 FAILED，靠平台侧自愈兜底
+| 事实 | 来源 |
+|---|---|
+| 作业 `application_1763473707704_1214`（Flink 1.13.1 tdata_sync） | DP 平台托管 |
+| 作业侧 `application-attempts = 0` | Flink Web UI |
+| 作业侧 `am.max-attempts = 0`（无效脏数据，Flink 不读） | Flink Web UI |
+| 集群 `yarn.resourcemanager.am.max-attempts` 未配置 | 用户确认 |
+| 集群 `yarn.resourcemanager.am.global.max-attempts` 未配置 | 用户确认 |
+| 作业稳定运行 **30 天+** | 用户确认 |
+
+**三方交叉验证**：
+
+1. **源码推导**：`maxAppAttempts = DEFAULT_RM_AM_MAX_ATTEMPTS = 2`
+2. **30 天运行**：反推 `maxAppAttempts >= 1`（否则 AM 启动不了）✅ 与源码推导一致
+3. **DP 平台设计**：这个 0 很可能是"委托给集群默认 + 平台自愈兜底"的有意设计
+
+**结论**：**HA 在 AM 级别正常工作**，但只能重试 1 次（相比生产推荐 10），稳定性依赖平台侧自愈兜底。
 
 ### 场景 C：作业侧 `application-attempts=0`，RM 侧 `am.max-attempts=0`
 
