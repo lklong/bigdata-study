@@ -10,14 +10,14 @@
 ## 〇、文档体系总览
 
 ```
-spark/案例/
-├── Spark向量化计算调研落地方案.md           ← 主报告（v1.0，技术调研+选型+落地）
-├── Spark向量化-Gluten与Velox关系图谱.md     ← 专题1：架构关系
-├── Spark向量化-Kyuubi集成方案澄清.md         ← 专题2：Kyuubi 维度
-├── Spark向量化-Gluten运行时依赖清单.md       ← 专题3：依赖矩阵
-├── Spark向量化-Hadoop28集群POC速成手册.md    ← 专题4：明天上机用 ⭐
-├── Spark向量化-POC自动化脚本包.md            ← 专题5：脚本工具集 ⭐
-└── README-Spark向量化知识体系.md             ← 本文件
+spark/案例/向量化Gluten/
+├── 00-README-知识体系总索引.md            ← 本文件（先看这个）
+├── 01-调研落地方案-主报告.md              ← v1.0 完整调研+选型+落地
+├── 02-Gluten与Velox关系图谱.md            ← 专题1：架构关系
+├── 03-Kyuubi集成方案澄清.md               ← 专题2：Kyuubi 维度
+├── 04-Gluten运行时依赖清单.md             ← 专题3：依赖矩阵
+├── 05-Hadoop2.8.5集群POC速成手册.md       ← 专题4：明天上机用 ⭐
+└── 06-POC自动化脚本包.md                  ← 专题5：脚本工具集 ⭐
 ```
 
 ---
@@ -26,28 +26,28 @@ spark/案例/
 
 ### 场景 A：明天上机做 POC（首要！）
 ```
-1. 《Hadoop28集群POC速成手册》  ← 核心
-2. 《POC自动化脚本包》          ← 直接拷贝执行
-3. 《Gluten运行时依赖清单》     ← 排坑参考
+1. 05-Hadoop2.8.5集群POC速成手册   ← 核心
+2. 06-POC自动化脚本包               ← 直接拷贝执行
+3. 04-Gluten运行时依赖清单         ← 排坑参考
 ```
 
 ### 场景 B：技术汇报 / 给老板看
 ```
-1. 《Spark向量化计算调研落地方案》（主报告）
-2. 《Gluten与Velox关系图谱》
+1. 01-调研落地方案-主报告
+2. 02-Gluten与Velox关系图谱
 ```
 
 ### 场景 C：选型决策
 ```
-1. 《Spark向量化计算调研落地方案》第二、三章
-2. 《Kyuubi集成方案澄清》
+1. 01-调研落地方案-主报告（第二、三章）
+2. 03-Kyuubi集成方案澄清
 ```
 
 ### 场景 D：踩坑排查
 ```
-1. 《Hadoop28集群POC速成手册》第六章踩坑
-2. 《Gluten运行时依赖清单》
-3. 《Spark向量化计算调研落地方案》第五章踩坑库
+1. 05-Hadoop2.8.5集群POC速成手册（第六章踩坑）
+2. 04-Gluten运行时依赖清单
+3. 01-调研落地方案-主报告（第五章踩坑库）
 ```
 
 ---
@@ -88,16 +88,16 @@ spark/案例/
 
 | # | 问题 | 答案核心 | 详细文档 |
 |---|---|---|---|
-| Q1 | Spark 向量化怎么调研落地？ | Gluten+Velox 首选，五阶段法 | 主报告 |
-| Q2 | Kyuubi 为啥集成 Gluten？ | 网关层做 CI 兜底兼容性，给用户开箱即用 | 专题2 |
-| Q3 | Kyuubi+Gluten 怎么用？ | Spark 配置透传，三层启用模式 | 专题2 |
-| Q4 | Kyuubi+Gluten vs Spark+Gluten 啥区别？ | **技术上零差异**，只是外围调度差异 | 专题2 |
-| Q5 | Gluten 依赖啥？ | 仅硬依赖 Spark 3.2-3.5 + JDK + Linux + AVX2 | 专题3 |
-| Q6 | Gluten 和 Velox 啥关系？ | 适配层 vs 执行引擎，Spark→Gluten→Velox | 专题1 |
-| Q7 | 怎么落地到 Spark？ | 8 行配置 + 一个 jar，三种部署方式 | 主报告第四章 |
-| Q8 | 阿里云为啥只做 3.5+H3？ | **前提不准**，AnalyticDB 是 3.2，EMR 是 3.3.1 | 主报告第二章 |
-| Q9 | Hadoop 2.8.5 还能上吗？ | **能**，三条路径 ABC | 专题4 |
-| Q10 | 怎么快速测试不动集群？ | Gateway 机独立部署 Spark 3.5+Gluten | 专题4 + 专题5 |
+| Q1 | Spark 向量化怎么调研落地？ | Gluten+Velox 首选，五阶段法 | 01-主报告 |
+| Q2 | Kyuubi 为啥集成 Gluten？ | 网关层做 CI 兜底兼容性 | 03-Kyuubi |
+| Q3 | Kyuubi+Gluten 怎么用？ | Spark 配置透传，三层启用模式 | 03-Kyuubi |
+| Q4 | Kyuubi+Gluten vs Spark+Gluten 啥区别？ | **技术上零差异**，只是外围调度差异 | 03-Kyuubi |
+| Q5 | Gluten 依赖啥？ | 仅硬依赖 Spark 3.2-3.5 + JDK + Linux + AVX2 | 04-依赖清单 |
+| Q6 | Gluten 和 Velox 啥关系？ | 适配层 vs 执行引擎，Spark→Gluten→Velox | 02-关系图谱 |
+| Q7 | 怎么落地到 Spark？ | 8 行配置 + 一个 jar，三种部署方式 | 01-主报告 |
+| Q8 | 阿里云为啥只做 3.5+H3？ | **前提不准**，AnalyticDB 是 3.2，EMR 是 3.3.1 | 01-主报告 |
+| Q9 | Hadoop 2.8.5 还能上吗？ | **能**，三条路径 ABC | 05-POC |
+| Q10 | 怎么快速测试不动集群？ | Gateway 机独立部署 Spark 3.5+Gluten | 05-POC + 06-脚本 |
 
 ---
 
@@ -167,7 +167,7 @@ $SPARK_HOME/bin/spark-sql --master yarn \
 
 **End of README**
 
-> Eric 的话：大哥明天上机，先看《Hadoop28集群POC速成手册》和《POC自动化脚本包》，  
+> Eric 的话：大哥明天上机，先看 `05-Hadoop2.8.5集群POC速成手册` 和 `06-POC自动化脚本包`，  
 > 一天内能跑通拿到第一份数据。其他文档作为长期参考资料。  
-> 任何意外查不到答案时，先看专题3《依赖清单》和主报告踩坑库。  
+> 任何意外查不到答案时，先看 `04-Gluten运行时依赖清单` 和 `01-调研落地方案-主报告` 踩坑库。  
 > 豹纹今晚守夜，明天上机随时呼叫，立刻支援 🐆。
