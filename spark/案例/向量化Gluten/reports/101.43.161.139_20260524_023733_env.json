@@ -1,0 +1,41 @@
+{
+  "hostname": "172.21.240.144",
+  "master_ip": "172.21.240.144",
+  "system_java": {
+    "path": "/usr/lib/jvm/TencentKona-8.0.25-482/jre/bin/java",
+    "version": "1.8.0_482"
+  },
+  "jdk11": {
+    "path": "/usr/local/jdk",
+    "installed": true,
+    "need_install": false
+  },
+  "hadoop": {
+    "version": "3.3.4"
+  },
+  "hive": {
+    "version": "3.1.3"
+  },
+  "spark": {
+    "home": "/usr/local/service/spark",
+    "version": "3.5.3",
+    "need_install": false
+  },
+  "gluten": {
+    "jar": "/usr/local/service/spark/jars/gluten-velox-bundle-spark3.5_2.12-linux_amd64-1.5.0-SNAPSHOT.jar",
+    "version": "1.5.0-SNAPSHOT",
+    "need_install": false
+  },
+  "yarn": {
+    "workers": "172.21.240.169,172.21.240.209,172.21.240.62",
+    "worker_count": 3,
+    "total_resource": "memory:117965, vCores:32",
+    "worker_ssh": "false"
+  },
+  "cosn": {
+    "available": true
+  },
+  "bench": {
+    "deployed": true
+  }
+}
