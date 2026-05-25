@@ -1,0 +1,8 @@
+q,mode,duration_ms,rc
+q1_agg,gluten,27563,0
+q2_join_2tables,gluten,26552,0
+q3_join_3tables,gluten,59564,0
+q4_window,gluten,33792,0
+q5_subquery,gluten,32566,0
+q6_self_join,gluten,32323,0
+q7_5tables,gluten,31207,0

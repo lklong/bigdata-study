@@ -1,0 +1,8 @@
+q,mode,duration_ms,rc
+q1_agg,native,37582,0
+q2_join_2tables,native,41761,0
+q3_join_3tables,native,120410,0
+q4_window,native,61425,0
+q5_subquery,native,79043,0
+q6_self_join,native,43099,0
+q7_5tables,native,82963,0
