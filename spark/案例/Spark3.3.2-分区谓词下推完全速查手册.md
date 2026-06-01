@@ -14,7 +14,9 @@
 每条结论都标了 [✅ 已实测] 或 [⚙️ 源码推断]。来源：
 
 - **[✅ 已实测]**：在 EMR 测试集群（172.21.240.4）用 `HiveCatalogMetrics.METRIC_PARTITIONS_FETCHED` 实测过，铁证
-- **[⚙️ 源码推断]**：基于 `HiveShim.convertFilters`（`HiveShim.scala` L857-1074）+ `TypeCoercion.PromoteStrings`（`TypeCoercion.scala` L1059-1091）+ `ExtractAttribute`（L980-990）+ `SupportedAttribute`（L944-962）逐 case 推导，**未必每个都跑过实测，但根据这几段不到 200 行的源码可以严格演绎**
+- **[⚙️ 源码推断]**：基于 `HiveShim.convertFilters`（`HiveShim.scala` L857-1074）+ `TypeCoercion.PromoteStrings`（`TypeCoercion.scala` L1059-1091）+ `AnsiTypeCoercion.PromoteStrings`（`AnsiTypeCoercion.scala` L229-271）+ `ExtractAttribute`（L980-990）+ `SupportedAttribute`（L944-962）逐 case 推导，**未必每个都跑过实测，但根据这几段源码可以严格演绎**
+
+**ANSI 模式说明**：本手册同时覆盖 `spark.sql.ansi.enabled=false`（默认）和 `=true` 两种模式。两种模式的类型提升规则不同，**部分场景下推行为相反**（详见 §二½）。如未特别标注，默认指 `ansi=false`。
 
 如发现任何标 [⚙️ 源码推断] 的与实测不符，请反馈，我会修正手册。
 
@@ -138,7 +140,122 @@ WHERE dt = '20260601'                    -- ❌
 
 ---
 
+## 二½、ANSI 模式对下推的影响（必读）
+
+`spark.sql.ansi.enabled` 是 Spark 3.x 的**重大行为开关**。它决定 Catalyst 在做类型提升（即决定"`分区列 op 字面量`"两边要 cast 成什么类型）时走两条**完全不同的代码路径**：
+
+- `ansi=false`（**默认**）：走 `TypeCoercion.scala` 里的 `PromoteStrings` → `findCommonTypeForBinaryComparison`
+- `ansi=true`：走 `AnsiTypeCoercion.scala` 里的 `PromoteStrings` → `findWiderTypeForString`
+
+**核心规则差异**（决定字符串与数值如何对齐）：
+
+| 字面量类型 | 列类型 | ansi=false 选 commonType | ansi=true 选 commonType |
+|---|---|---|---|
+| String | IntegralType（Int/Long/Short/Byte） | **对面类型**（Int/Long/...）| **`LongType`**（统一选 long） |
+| String | FractionalType（Float/Double） | **对面类型** | **`DoubleType`**（统一选 double） |
+| String | DateType | **`DateType`**（除非 `castDatetimeToString`） | DateType |
+| String | TimestampType | **`TimestampType`** | TimestampType |
+| String | DecimalType | **`DoubleType`**（SPARK-22469） | DecimalType |
+| String | NullType | StringType | StringType |
+
+**关键源码**（ansi=true 路径）：
+
+> ```139:152:sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/AnsiTypeCoercion.scala
+>   private def findWiderTypeForString(dt1: DataType, dt2: DataType): Option[DataType] = {
+>     (dt1, dt2) match {
+>       case (StringType, _: IntegralType) => Some(LongType)
+>       case (StringType, _: FractionalType) => Some(DoubleType)
+>       case (StringType, NullType) => Some(StringType)
+>       case (StringType, _: AnsiIntervalType) => None
+>       case (StringType, a: AtomicType) => Some(a)
+>       case (other, StringType) if other != StringType => findWiderTypeForString(StringType, other)
+>       case _ => None
+>     }
+>   }
+> ```
+
+### 二½.1 ANSI 模式对下推的两类影响
+
+#### 影响 A：cast 目标类型变化（结论可能不变）
+
+```sql
+-- string 分区列, 数字字面量
+WHERE string_dt = 20260601
+```
+
+| 模式 | Analyzer 改写 | ExtractAttribute 判定 | 下推 |
+|---|---|---|---|
+| ansi=false | `cast(dt as int) = 20260601` | child=String 非 IntegralType → 拒 | ❌ |
+| ansi=true | `cast(dt as bigint) = cast(20260601 as bigint)` | child=String 非 IntegralType → 拒 | ❌ |
+
+🟢 **业务结论一致：都不下推**，但 cast 目标类型不同（int vs bigint）。
+
+#### 影响 B：⚠️ ansi=true 让某些原本不下推的场景反过来能下推
+
+```sql
+-- INT 分区列, 字符串字面量（ansi 切换会造成下推行为相反）
+WHERE int_dt = '20260601'
+```
+
+| 模式 | Analyzer 改写 | ExtractAttribute 判定 | 下推 |
+|---|---|---|---|
+| ansi=false | `cast(int_dt as string) = '20260601'` | child=Int → IntegralType ✓，但 dt=String 非 IntegralType → 拒（第二 case 守卫不满足）| ❌ |
+| ansi=true | `cast(int_dt as bigint) = cast('20260601' as bigint)` | child=Int → IntegralType，dt=Bigint → IntegralType，且 `Cast.canUpCast(Int, Long)=true` → **解包成功** | **✅** |
+
+🚨 **业务结论相反**：ansi 切换导致下推行为反过来！相同的 SQL 在不同集群可能完全不同表现。
+
+#### 影响 C：⚠️ ansi=true 下 string 字面量解析失败会**抛运行时异常**
+
+```sql
+-- 注意: ansi=true 下, 如果字符串无法解析为对应数值类型, 运行时会抛 SparkNumberFormatException
+WHERE int_dt = 'abc'        -- ansi=false: Filter 求值得 NULL, 不命中
+                            -- ansi=true: 运行时抛错
+WHERE int_dt = '20260601a'  -- 同上
+```
+
+这是 ANSI SQL 标准的"严格类型转换"语义。**实测时要预期看到异常而不是空结果**，本手册标注的"下推 ✅"指逻辑层面真下推到 HMS，不代表 SQL 一定能跑出结果。
+
+### 二½.2 ANSI 模式下的对照速查表（重要场景）
+
+| 分区列 | SQL 谓词 | ansi=false 下推 | ansi=true 下推 | 行为相同？ |
+|---|---|---|---|---|
+| STRING | `dt = '20260601'` | ✅ | ✅ | ✓ |
+| STRING | `dt = 20260601` | ❌ 全拉 | ❌ 全拉 | ✓ |
+| STRING | `dt > '20260601'` | ✅ | ✅ | ✓ |
+| INT | `dt = 20260601` | ✅ | ✅（cast 到 bigint upcast 解包） | ✓ |
+| INT | `dt = '20260601'` | ❌ 全拉 | **✅** | ✗ **相反！** |
+| BIGINT | `dt = 20260601` | ✅ | ✅ | ✓ |
+| BIGINT | `dt = '20260601'` | ❌ 全拉 | **✅** | ✗ **相反！** |
+| BIGINT | `dt = 20260601L` | ✅ | ✅ | ✓ |
+| DATE | `dt = DATE '2026-06-01'` | ✅ | ✅ | ✓ |
+| DATE | `dt = '2026-06-01'` | ✅ | ✅ | ✓ |
+| DATE | `dt = 20260601`（数字） | ❌ 全拉 | ❌ 全拉 | ✓ |
+| VARCHAR(N) | 任意 | ❌ 全拉 | ❌ 全拉 | ✓ |
+| FLOAT/DOUBLE | 任意 | ❌ 全拉 | ❌ 全拉 | ✓ |
+
+**两条铁律的修订（覆盖 ANSI 模式）**：
+
+- **铁律 1**（不变）：分区列必须以"裸列"或"整型 upcast"形式出现 → ANSI 不影响
+- **铁律 2 修订**：分区列与字面量类型严格一致 → 在 ANSI 模式下放宽：**INT/BIGINT 分区列与字符串字面量"事实上能下推"**（因 string 字面量被 cast 到 bigint，且 int→bigint 是 upcast，分区列上的 cast 被 ExtractAttribute 解包）；但**仍强烈建议类型对齐**，因为：
+  1. ansi=true 不是默认值，业务方未必都开
+  2. ansi=true 下字符串解析失败会抛运行时异常，比 ansi=false 下"NULL+无结果"更难 debug
+  3. 为防止集群 ANSI 配置变更导致行为飘移，**写 SQL 应当类型严格一致**，不依赖 ANSI 路径
+- **铁律 3**（不变）：VARCHAR/CHAR 分区列永远不下推 → ANSI 不影响
+
+### 二½.3 检查你集群当前模式
+
+```sql
+SET spark.sql.ansi.enabled;
+```
+
+如果你的集群默认开了 ansi=true（部分 EMR / Databricks 自定义版会默认开），**要重点检查**手册中带 ✗ 标记的场景。
+
+---
+
 ## 三、按"分区列类型"分类的完全速查表
+
+> 📌 **以下所有表格的"下推"列默认为 `spark.sql.ansi.enabled=false`（默认模式）的结果**。
+> 若集群 ANSI 模式开启，请同时对照 §二½ 「ANSI 模式对下推的影响」中标 ✗ 的差异场景。
 
 ### 3.1 STRING 分区列（最常见）
 
@@ -175,7 +292,8 @@ WHERE dt = '20260601'                    -- ❌
 | `dt = 20260601`（dt 是 INT） | 同形态 | ✅ | [⚙️ 源码推断]（裸列，命中 L1031） |
 | `dt = 20260601L`（dt 是 INT） | `cast(dt as bigint) = 20260601L` | ✅ | [⚙️ 源码推断]（int→bigint 是 upcast，ExtractAttribute 解包成功） |
 | `dt = 20260601`（dt 是 BIGINT） | `dt = 20260601L`（字面量提升） | ✅ | [⚙️ 源码推断] |
-| `dt = '20260601'`（dt 是 INT/BIGINT） | `cast(dt as string) = '20260601'` | ❌ 全拉 | [⚙️ 源码推断]（string 不是 IntegralType，ExtractAttribute 拒） |
+| `dt = '20260601'`（dt 是 INT/BIGINT） | ansi=false: `cast(dt as string) = '20260601'` | ❌ 全拉 | [⚙️ 源码推断] |
+| 🚨 同上 + **ansi=true** | `cast(dt as bigint) = cast('20260601' as bigint)` | **✅** | [⚙️ 源码推断]（详见 §二½ 影响 B） |
 | `dt = 20260601D` 即 double 字面量（dt 是 INT） | `cast(dt as double) = 20260601D` | ❌ 全拉 | [⚙️ 源码推断]（int→double 不是 upcast，且 SupportedAttribute 不支持 double） |
 | `dt > 20260601`（dt 是 INT） | 同形态 | ✅ | [⚙️ 源码推断] |
 | `dt IN (20260601, 20260602)`（dt 是 INT） | 同形态 | ✅ | [⚙️ 源码推断] |
@@ -433,14 +551,30 @@ WHERE dt IN (SELECT ...)                 -- ❌ 子查询元素不可下推
 
 ## 八、关键源码与默认值速查
 
-| 项 | 值 | 位置 |
+### 8.1 SQL 配置参数
+
+| 参数 | 默认值 / 引入版本 | 位置 |
 |---|---|---|
 | `spark.sql.hive.metastorePartitionPruning` | `true`（1.5.0+） | `SQLConf.scala` L1135-1141 |
 | `spark.sql.hive.metastorePartitionPruningInSetThreshold` | `1000`（3.1.0+） | `SQLConf.scala` L1143-1155 |
 | `spark.sql.hive.metastorePartitionPruningFallbackOnException` | `false`（3.3.0+） | `SQLConf.scala` L1157-1165 |
 | `spark.sql.hive.metastorePartitionPruningFastFallback` | `false`（3.3.0+） | `SQLConf.scala` L1167-1176 |
 | `spark.sql.hive.advancedPartitionPredicatePushdown.enabled` | `true`（2.3.0+） | `SQLConf.scala` L530-536 |
-| `spark.sql.ansi.enabled` | `false`（3.0.0+） | `SQLConf.scala` 影响 PromoteStrings 是否生效 |
+| `spark.sql.ansi.enabled` | `false`（3.0.0+） | 决定走 `TypeCoercion` 还是 `AnsiTypeCoercion` |
+
+### 8.2 关键源码定位
+
+| 模块 | 文件 | 关键行 | 作用 |
+|---|---|---|---|
+| Hive 端 filter 转换 | `sql/hive/.../client/HiveShim.scala` | L857-1074 `convertFilters` | 把 Catalyst expr 转成 Hive metastore filter 字符串 |
+| 同上 | 同上 | L980-990 `ExtractAttribute` | 决定 cast 是否解包 |
+| 同上 | 同上 | L944-962 `SupportedAttribute` | 分区列类型白名单 |
+| 同上 | 同上 | L1138-1194 `prunePartitionsFastFallback` | 不下推时的兜底路径 |
+| 类型提升（默认） | `sql/catalyst/.../analysis/TypeCoercion.scala` | L1059-1091 `PromoteStrings` | string ↔ 数值的 cast 改写 |
+| 同上 | 同上 | L884-911 `findCommonTypeForBinaryComparison` | 决定 commonType 选哪个 |
+| **类型提升（ANSI）** | `sql/catalyst/.../analysis/AnsiTypeCoercion.scala` | L229-271 `PromoteStrings` | ansi=true 路径的 cast 改写 |
+| 同上 | 同上 | L139-152 `findWiderTypeForString` | string + IntegralType 统一选 LongType |
+| 入口规则 | `sql/hive/.../execution/PruneHiveTablePartitions.scala` | L93-108 `apply` | 整条链路入口 |
 
 ---
 
@@ -522,7 +656,7 @@ WHERE dt IN (SELECT ...)                 -- ❌ 子查询元素不可下推
 1. **范围**：仅覆盖 Spark 3.3.x + Hive 元数据存储。不涉及 Iceberg / Delta / Hudi 等表格式（它们走自己的分区裁剪路径，不经过 `HiveShim.convertFilters`）。
 2. **版本**：Spark 4.x 增强了 fast-fallback 的逻辑（SPARK-44388 / SPARK-48037 等），3.5/4.x 行为可能不同。下次升级要重做实测。
 3. **DataSource v2 / file source**：本手册仅对 `HiveTableRelation`。对 `LogicalRelation(... HadoopFsRelation)` 路径走 `PruneFileSourcePartitions`，逻辑独立。
-4. **ANSI 模式**：`spark.sql.ansi.enabled=true` 时 TypeCoercion 走 `AnsiTypeCoercion.scala` 而非 `TypeCoercion.scala`，规则不同。本手册仅适用默认（`false`）模式。
+4. **ANSI 模式**：本手册同时覆盖 `spark.sql.ansi.enabled=false`（默认）和 `=true`，差异在 §二½ 集中说明。但 ANSI 模式下的所有结论目前是 [⚙️ 源码推断]，**未经 EMR 集群实测**。如果你的集群默认开 ansi=true，建议跑配套实测脚本验证后再依赖手册结论。
 
 如遇到本手册没覆盖的场景，按 §六 的金标准做实测，欢迎补充进来。
 
@@ -533,3 +667,4 @@ WHERE dt IN (SELECT ...)                 -- ❌ 子查询元素不可下推
 | 日期 | 变更 | 触发 |
 |---|---|---|
 | 2026-06-01 | 初稿 | 配套案例归档完成后产出 |
+| 2026-06-01 | 新增 §二½ ANSI 模式对下推的影响专章；§3.2 加 ANSI 高亮行；§八 新增源码定位表 | eric challenge: ansi=true 路径未覆盖 |

@@ -3,7 +3,7 @@
 > **审查目标**：本案例 `Spark3.3.2-string分区列与数字字面量谓词不下推案例.md` 的分析过程  
 > **审查角色**：eric（自我 challenge）  
 > **日期**：2026-06-01  
-> **目的**：把分析过程中的 6 处失误、纠错路径、教训沉淀单独归档，与正式案例分离
+> **目的**：把分析过程中的 7 处失误、纠错路径、教训沉淀单独归档，与正式案例分离
 
 ---
 
@@ -172,6 +172,64 @@ TTransportException: Cannot write to null outputStream
 
 ---
 
+### 失误 7：速查手册一开始**只覆盖了 ansi=false 路径**，对 ansi=true 一笔带过
+
+**犯错位置**：归档完速查手册后，eric 立刻 challenge："`spark.sql.ansi.enabled=true/false` 两个模式都梳理输出了吗"。
+
+**实际真相**：第一版手册里 ANSI 模式只在两处一笔带过——
+
+- §四 4.2 末行："`spark.sql.ansi.enabled=true` 时改走 AnsiTypeCoercion，规则不同"
+- §十一 局限："本手册仅适用默认（false）模式"
+
+**完全没有研究过 `AnsiTypeCoercion.scala` 源码、没有梳理两条路径的差异、更没在实测脚本里跑 ansi=true。**
+
+**回去读 `AnsiTypeCoercion.scala`**，发现两个**重大且反直觉**的事实：
+
+1. **ANSI 模式下 PromoteStrings 仍然跑**：源码注释（L71-73）明说"为了不挂太多 Spark SQL 用户的查询，AnsiTypeCoercion 仍保留 string→数值的隐式提升，这是 Spark 自加的特殊规则，不是 ANSI SQL 标准"。
+2. **核心规则函数从 `findCommonTypeForBinaryComparison` 换成 `findWiderTypeForString`**，且后者对 String + IntegralType 的处理是**统一选 LongType**（L141），而不是选对面类型：
+
+> ```139:152:sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/AnsiTypeCoercion.scala
+>   private def findWiderTypeForString(dt1: DataType, dt2: DataType): Option[DataType] = {
+>     (dt1, dt2) match {
+>       case (StringType, _: IntegralType) => Some(LongType)        // ← 统一选 long, 而不是对面类型
+>       case (StringType, _: FractionalType) => Some(DoubleType)   // ← 统一选 double
+>       case (StringType, NullType) => Some(StringType)
+>       case (StringType, _: AnsiIntervalType) => None
+>       case (StringType, a: AtomicType) => Some(a)
+>       case (other, StringType) if other != StringType => findWiderTypeForString(StringType, other)
+>       case _ => None
+>     }
+>   }
+> ```
+
+**这个差异导致 INT/BIGINT 分区列 + 字符串字面量场景下推行为完全相反**：
+
+| 分区列 | SQL | ansi=false 改写 | ansi=false 下推 | ansi=true 改写 | ansi=true 下推 |
+|---|---|---|---|---|---|
+| INT | `dt = '20260601'` | `cast(dt as string) = '20260601'` | ❌ 全拉 | `cast(dt as bigint) = cast('...' as bigint)` | **✅ 下推**（int→bigint upcast 解包） |
+| BIGINT | `dt = '20260601'` | `cast(dt as string) = '...'` | ❌ 全拉 | `dt = cast('...' as bigint)` | **✅ 下推**（裸列） |
+
+🚨 **同一条 SQL 在不同集群的下推行为可能完全相反**——如果业务方依赖某行为，集群把 ANSI 配置一翻，SQL 性能反差一个量级。
+
+**纠错动作**：
+
+1. 速查手册 §〇 可信级别加 ANSI 模式说明
+2. 新增 §二½「ANSI 模式对下推的影响」专章，列两条路径的核心差异 + 三类影响（A 仅 cast 类型变 B 下推行为相反 C ansi=true 下运行时异常）+ 关键场景对照表
+3. §3.2 INT/BIGINT 表里**显式新增一行 ★ANSI★ 标记**，提示集群切换 ANSI 时下推行为相反
+4. §八 关键源码与默认值速查 拆成 8.1 配置 + 8.2 源码定位，把 `AnsiTypeCoercion.scala` 关键行加进去
+5. §十一 局限改写：**两个模式都覆盖**，但 ANSI 下结论目前都是 [⚙️ 源码推断]，未实测
+6. 实测脚本 v2：每个 TestCase 多 `expectedFetchedAnsi` 字段，外层循环跑 ansi=false / ansi=true 两轮，最后 Stage 4 专门对比 ANSI 敏感用例的实际差异
+
+**教训**：
+
+> **任何"两个模式开关"的结论必须把每个模式都研究透。看到一个 if/else 切换就以为只是细节差异是偷懒——`spark.sql.ansi.enabled` 这种重大开关下，整套 TypeCoercion 可能是另一份代码（`TypeCoercion.scala` vs `AnsiTypeCoercion.scala`）。"模式 A 默认所以只研究 A"是不合规的产出。**
+
+> **附带规则**：交付前必须自查"我有没有跳过任何带 enabled / mode / strategy 后缀的开关？"，特别是 Spark / Hadoop / Hive 这种长期演进的项目，这类开关越积越多，每个都可能改变核心路径。
+
+---
+
+
+
 
 
 ## 二、纠错路径总览
@@ -199,7 +257,10 @@ flowchart LR
     Q7["eric 追问:<br/>那个 count 是<br/>累加值吧"]:::user
     A7["确认: 是 codahale Counter<br/>单调累加, 需要 reset()<br/>结论不变, 但脚本写法改进"]:::green
 
-    Q1 --> A1 --> Q2 --> A2 --> Q3 --> A3 --> Q4 --> A4 --> Q5 --> A5 --> Q6 --> A6 --> Q7 --> A7
+    Q8["eric 追问:<br/>ansi=true/false<br/>都梳理了吗"]:::user
+    A8["回去读 AnsiTypeCoercion 源码:<br/>findWiderTypeForString 选 LongType<br/>导致 INT/BIGINT + string lit<br/>下推行为相反!<br/>速查手册新增 §二½ 专章"]:::green
+
+    Q1 --> A1 --> Q2 --> A2 --> Q3 --> A3 --> Q4 --> A4 --> Q5 --> A5 --> Q6 --> A6 --> Q7 --> A7 --> Q8 --> A8
 
     classDef user fill:#e3f2fd,stroke:#1976d2,color:#000
     classDef red fill:#ffcdd2,stroke:#c62828,color:#000
@@ -264,6 +325,27 @@ flowchart LR
 - ✅ 每段查询前 `HiveCatalogMetrics.reset()` 显式归零，输出绝对值（语义清晰）
 - ⚠️ 也可以记录 `b0/b1/b2/...` 算 delta（语义等价），但脚本必须显式说明"这是累加值，看 delta 不看 total"
 - ❌ 直接输出 `getCount()` 让读者自己算差，且不说明累加性质（容易误导）
+
+### 规则 G：模式开关（enabled / mode / strategy）必须每个模式都研究透
+
+任何带 `enabled` / `mode` / `strategy` 后缀的核心开关，**两侧都必须梳理**：
+
+- 不允许"模式 A 是默认所以只研究 A"——别的发行版（EMR / Databricks / 自建版）默认值可能不同
+- 不允许只看一个模式的源码就推断另一个——不同模式可能走完全独立的代码路径（如 `TypeCoercion.scala` vs `AnsiTypeCoercion.scala` 是两份独立 Scala 文件）
+- 实测脚本必须**双轮跑**两个模式，输出对照差异
+
+**Spark 常见双模式开关速查（产出文档时优先排查这些）**：
+
+| 开关 | true 走哪条路径 | false 走哪条路径 |
+|---|---|---|
+| `spark.sql.ansi.enabled` | `AnsiTypeCoercion.scala` 全套规则 | `TypeCoercion.scala` 全套规则 |
+| `spark.sql.adaptive.enabled` | AQE 物理优化 | 静态执行计划 |
+| `spark.sql.legacy.timeParserPolicy` | LEGACY/CORRECTED 不同的 SimpleDateFormat 处理 | EXCEPTION 严格语义 |
+| `spark.sql.storeAssignmentPolicy` | ANSI/STRICT/LEGACY 三种 INSERT 类型检查 | — |
+| `spark.sql.legacy.parquetNanosAsLong` | 旧 Parquet timestamp 行为 | 新行为 |
+| `spark.sql.hive.convertMetastoreParquet` | 走 Spark vectorized reader | 走 Hive SerDe |
+
+写文档前必查：你的结论涉及上面任意开关吗？涉及就两个模式都研究。
 
 ---
 
