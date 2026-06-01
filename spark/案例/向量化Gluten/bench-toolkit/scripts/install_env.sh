@@ -11,9 +11,10 @@ ENV_JSON=${1:-/tmp/env.json}
 TOOLKIT_DIR=${2:-/tmp/bench-toolkit}
 
 # 包源（可通过环境变量覆盖）
-JDK11_URL=${JDK11_URL:-https://github.com/Tencent/TencentKona-11/releases/download/kona11.0.27/TencentKona-11.0.27.b1-jdk_linux-x86_64.tar.gz}
-GLUTEN_URL=${GLUTEN_URL:-https://repository.apache.org/content/repositories/snapshots/org/apache/gluten/gluten-velox-bundle/1.5.0-SNAPSHOT/gluten-velox-bundle-spark3.5_2.12-linux_amd64-1.5.0-SNAPSHOT.jar}
-SPARK_PKG_PATH=${SPARK_PKG_PATH:-/home/hadoop/spark.tar.gz}  # 已存在的本地 EMR Spark 包
+JDK11_URL=${JDK11_URL:-https://lkl-bj-update-1308597516.cos.ap-beijing.myqcloud.com/meson/TencentKona-11.0.27.b1-jdk_linux-x86_64.tar.gz}
+# Gluten jar 已经打包在 Spark tar 内（spark/jars/ 下已有 gluten-velox-bundle*.jar），不再单独下载
+SPARK_PKG_URL=${SPARK_PKG_URL:-https://lkl-bj-update-1308597516.cos.ap-beijing.myqcloud.com/meson/spark-emr3.5.3-gluten.tar.gz}
+SPARK_PKG_PATH=${SPARK_PKG_PATH:-/home/hadoop/spark-emr3.5.3-gluten.tar.gz}  # 本地缓存路径（不存在时从 SPARK_PKG_URL 下载）
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 log()  { echo -e "${CYAN}[$(date +'%H:%M:%S')] $*${NC}"; }
@@ -49,7 +50,7 @@ if [ "$JDK11_INSTALLED" != "true" ]; then
   log "Step 1: 安装 Tencent Kona JDK 11 到 master"
   cd /tmp
   if [ ! -f kona11.tar.gz ]; then
-    wget -q --show-progress -O kona11.tar.gz "$JDK11_URL" || { err "JDK11 下载失败"; exit 1; }
+  wget -q -O kona11.tar.gz "$JDK11_URL" || { err "JDK11 下载失败"; exit 1; }
   fi
   tar -xf kona11.tar.gz -C /usr/local/
   KONA_DIR=$(ls -d /usr/local/TencentKona-11* | head -1)
@@ -59,71 +60,107 @@ else
   ok "JDK 11 已装（跳过）"
 fi
 
-# ============= 装 JDK 11 到 worker（如果 SSH 互通）=============
-if [ "$WORKER_SSH" = "true" ] || [ "$WORKER_SSH" = "root_only" ]; then
-  log "Step 1b: 批量装 JDK 11 到 worker（$WORKERS）"
-  USER_=hadoop
-  [ "$WORKER_SSH" = "root_only" ] && USER_=root
+# ============= Worker JDK11 校验（EMR 镜像默认有 /usr/local/jdk-11.0.10）=============
+# 思路：EMR 出厂镜像 worker 已经有 /usr/local/jdk-11.0.10，无需分发；
+#      bench_all.sh 等通过绝对路径 ${WORKER_JAVA_HOME} 引用即可。
+log "Step 1b: 校验 worker 上的 JDK 11（不分发，直接引用 EMR 自带 /usr/local/jdk-11.0.10）"
+
+WORKER_JAVA_HOME_EXPECT=/usr/local/jdk-11.0.10
+PROBE=/tmp/probe_worker_jdk_inner.sh
+cat > $PROBE << 'PROBE_EOF'
+#!/bin/bash
+H=$(hostname); IP=$(hostname -I | awk '{print $1}')
+if [ -x /usr/local/jdk-11.0.10/bin/java ]; then
+  V=$(/usr/local/jdk-11.0.10/bin/java -version 2>&1 | head -1)
+  echo "OK $H $IP $V"
+else
+  echo "MISS $H $IP /usr/local/jdk-11.0.10 NOT FOUND"
+fi
+exit 0
+PROBE_EOF
+chmod +x $PROBE
+chown hadoop:hadoop $PROBE
+
+# 用 hadoop streaming 跑 mapper-only：让每个 worker 节点都跑一次
+INPUT_PROBE=/tmp/probe_input_jdk
+echo -e "1\n2\n3\n4\n5\n6\n7\n8" > /tmp/probe_lines.txt
+su - hadoop -c "hadoop fs -rm -r -f $INPUT_PROBE /tmp/probe_jdk_output 2>/dev/null; hadoop fs -mkdir -p $INPUT_PROBE; hadoop fs -put -f /tmp/probe_lines.txt $INPUT_PROBE/"
+
+STREAM_JAR=$(find /usr/local/service/hadoop -name "hadoop-streaming-*.jar" 2>/dev/null | head -1)
+if [ -z "$STREAM_JAR" ]; then
+  warn "  未找到 hadoop-streaming jar，跳过 worker JDK 校验"
+else
+  log "  通过 YARN 在所有 worker 上探测 JDK11（streaming map-only job）"
+  PROBE_LOG=$(su - hadoop -c "hadoop jar $STREAM_JAR \
+    -D mapreduce.job.reduces=0 \
+    -D mapreduce.map.memory.mb=512 \
+    -input $INPUT_PROBE \
+    -output /tmp/probe_jdk_output \
+    -mapper $PROBE \
+    -file $PROBE 2>&1" | tail -3)
   
-  for w in $(echo "$WORKERS" | tr ',' ' '); do
-    log "  → $w"
-    if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no $USER_@$w "[ -x /usr/local/jdk/bin/java ]" 2>/dev/null; then
-      ok "    $w JDK11 已装，跳过"
-      continue
-    fi
-    scp -o StrictHostKeyChecking=no /tmp/kona11.tar.gz $USER_@$w:/tmp/ 2>&1 | tail -1
-    if [ "$USER_" = "root" ]; then
-      ssh -o StrictHostKeyChecking=no root@$w "tar -xf /tmp/kona11.tar.gz -C /usr/local/ && ln -snf /usr/local/TencentKona-11* /usr/local/jdk && /usr/local/jdk/bin/java -version 2>&1 | head -1"
+  PROBE_RESULT=$(su - hadoop -c "hadoop fs -cat /tmp/probe_jdk_output/part-* 2>/dev/null" | sort -u)
+  echo "$PROBE_RESULT" | while read line; do
+    [ -z "$line" ] && continue
+    if echo "$line" | grep -q "^OK"; then
+      ok "  $line"
     else
-      ssh -o StrictHostKeyChecking=no hadoop@$w "tar -xf /tmp/kona11.tar.gz -C ~/ && ln -snf ~/TencentKona-11* ~/jdk11"
-      warn "    $w 装到了 ~hadoop/jdk11（无 root 权限装到 /usr/local），spark 提交时 spark.executorEnv.JAVA_HOME 要指这个"
+      err "  $line"
     fi
   done
-  ok "Worker JDK 11 批量安装完成"
-elif [ "$WORKER_SSH" = "false" ]; then
-  warn "Step 1b: Worker SSH 不互通，跳过批量装 JDK 11"
-  warn "  如果 worker 上还没有 JDK 11，spark executor 会启动失败"
-  warn "  请大哥手动装：每个 worker 上跑安装命令"
-  echo
-  echo "  手动装命令（在每个 worker 上以 root 执行）："
-  for w in $(echo "$WORKERS" | tr ',' ' '); do
-    echo "    ssh root@$w 'wget -O /tmp/k.tar.gz $JDK11_URL && tar -xf /tmp/k.tar.gz -C /usr/local/ && ln -snf /usr/local/TencentKona-11* /usr/local/jdk'"
-  done
-  echo
+  
+  if echo "$PROBE_RESULT" | grep -q "^MISS"; then
+    err "  有 worker 缺少 $WORKER_JAVA_HOME_EXPECT，spark executor 启动会失败"
+    err "  对应 worker 需手动安装 JDK11 到 /usr/local/jdk-11.0.10"
+    exit 1
+  fi
+  ok "  所有 worker 已有 $WORKER_JAVA_HOME_EXPECT"
 fi
 
 # ============= 装 Spark 3.5 =============
 if [ "$NEED_SPARK" = "true" ]; then
-  log "Step 2: 安装 Spark 3.5"
-  if [ -f "$SPARK_PKG_PATH" ]; then
-    log "  使用本地包：$SPARK_PKG_PATH"
-    [ -d /usr/local/service/spark ] && mv /usr/local/service/spark /usr/local/service/spark.bak.$(date +%Y%m%d_%H%M%S)
-    mkdir -p /usr/local/service
-    tar -xf $SPARK_PKG_PATH -C /usr/local/service/
-    # 解压后可能叫 spark-3.5.3-emr 或 spark
-    cd /usr/local/service
-    if [ -d spark-3.5.3-emr ]; then mv spark-3.5.3-emr spark; fi
-    chown -R hadoop:hadoop spark
-    ok "Spark 3.5 已装到 /usr/local/service/spark"
-  else
-    err "未找到 Spark 包：$SPARK_PKG_PATH"
-    err "请把 EMR 的 spark.tar.gz 放到 /home/hadoop/，或设置 SPARK_PKG_PATH 环境变量"
+  log "Step 2: 安装 Spark 3.5（自带 Gluten）"
+  if [ ! -f "$SPARK_PKG_PATH" ]; then
+    log "  本地未发现 $SPARK_PKG_PATH，从 COS 下载：$SPARK_PKG_URL"
+    mkdir -p "$(dirname "$SPARK_PKG_PATH")"
+    wget -q -O "$SPARK_PKG_PATH" "$SPARK_PKG_URL" || { err "Spark 包下载失败：$SPARK_PKG_URL"; rm -f "$SPARK_PKG_PATH"; exit 1; }
+    ok "  已下载到 $SPARK_PKG_PATH ($(du -h "$SPARK_PKG_PATH" | awk '{print $1}'))"
+  fi
+  log "  使用本地包：$SPARK_PKG_PATH"
+  [ -d /usr/local/service/spark ] && mv /usr/local/service/spark /usr/local/service/spark.bak.$(date +%Y%m%d_%H%M%S)
+  mkdir -p /usr/local/service
+  tar -xf "$SPARK_PKG_PATH" -C /usr/local/service/
+  # 解压后可能叫 spark-3.5.3-emr / spark-emr3.5.3-gluten / spark 等，统一规整
+  cd /usr/local/service
+  if [ ! -d spark ]; then
+    SPARK_EXTRACTED=$(ls -dt spark-* spark_* 2>/dev/null | head -1)
+    if [ -n "$SPARK_EXTRACTED" ] && [ -d "$SPARK_EXTRACTED" ]; then
+      mv "$SPARK_EXTRACTED" spark
+    fi
+  fi
+  if [ ! -d /usr/local/service/spark ]; then
+    err "解压后未找到 spark 目录，请检查 tar 内层结构"
+    ls -la /usr/local/service/
     exit 1
   fi
+  chown -R hadoop:hadoop spark
+  ok "Spark 3.5 已装到 /usr/local/service/spark"
 else
   ok "Spark $SPARK_VER 已装（跳过）"
 fi
 
 # ============= 装 Gluten =============
 if [ "$NEED_GLUTEN" = "true" ]; then
-  log "Step 3: 安装 Gluten Velox bundle jar"
-  cd /tmp
-  if [ ! -f gluten.jar ]; then
-    wget -q --show-progress -O gluten.jar "$GLUTEN_URL" || { err "Gluten 下载失败"; exit 1; }
+  log "Step 3: 校验 Gluten Velox bundle jar（已随 Spark 包附带）"
+  GLUTEN_JAR=$(ls /usr/local/service/spark/jars/gluten-velox-bundle-*.jar 2>/dev/null | head -1)
+  if [ -n "$GLUTEN_JAR" ]; then
+    chown hadoop:hadoop "$GLUTEN_JAR"
+    ok "Gluten 已随 Spark 包安装：$GLUTEN_JAR"
+  else
+    err "Spark jars/ 下未发现 gluten-velox-bundle*.jar"
+    err "请确认 $SPARK_PKG_PATH 已包含 Gluten jar，或手动放入 /usr/local/service/spark/jars/"
+    exit 1
   fi
-  cp gluten.jar /usr/local/service/spark/jars/gluten-velox-bundle-spark3.5_2.12-linux_amd64-1.5.0-SNAPSHOT.jar
-  chown hadoop:hadoop /usr/local/service/spark/jars/gluten-velox-bundle-*.jar
-  ok "Gluten 1.5.0-SNAPSHOT 已装"
 else
   ok "Gluten $GLUTEN_VER 已装（跳过）"
 fi

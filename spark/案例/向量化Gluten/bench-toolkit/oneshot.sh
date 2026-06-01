@@ -3,18 +3,22 @@
 # 终极一键入口：本地执行，给个 IP 就出 2x2 矩阵报告
 #
 # 用法：
-#   ./oneshot.sh <master_ip>                  # 全自动（探测+装环境+跑 4 单元）
-#   ./oneshot.sh <master_ip> inspect          # 只体检
-#   ./oneshot.sh <master_ip> install          # 只装环境
-#   ./oneshot.sh <master_ip> bench [hdfs|cosn|all]  # 只跑 bench
-#   ./oneshot.sh <master_ip> report           # 只取报告
+#   ./oneshot.sh <master_ip> [action] [bench_mode] [ssh_key]
+#
+#   ./oneshot.sh <master_ip>                                  # 全自动（探测+装环境+跑 4 单元）
+#   ./oneshot.sh <master_ip> inspect                          # 只体检
+#   ./oneshot.sh <master_ip> install                          # 只装环境
+#   ./oneshot.sh <master_ip> bench [hdfs|cosn|all]            # 只跑 bench
+#   ./oneshot.sh <master_ip> report                           # 只取报告
 #
 # 例子：
-#   ./oneshot.sh 62.234.130.135               # H2 集群一键
-#   ./oneshot.sh 101.43.161.139 bench cosn    # H3 只跑 cosn bench
+#   ./oneshot.sh 62.234.130.135                               # H2 集群一键（默认免密）
+#   ./oneshot.sh 101.43.161.139 bench cosn                    # H3 只跑 cosn bench
+#   ./oneshot.sh 152.136.174.154 all all "C:\Users\lkl\Desktop\lkl_meson.pem"   # 用密钥登录
+#   SSH_KEY=~/lkl_meson.pem ./oneshot.sh 152.136.174.154      # 也可用环境变量传密钥
 #
 # 前提：
-#   1. 你能 ssh root@<master_ip>（公钥免密 / 已经在 known_hosts）
+#   1. 你能 ssh root@<master_ip>（公钥免密 / 已经在 known_hosts / 或者提供 -i <key>）
 #   2. master 上 root 能 su - hadoop（EMR 默认 OK）
 #
 # 输出：
@@ -23,9 +27,27 @@
 # ====================================================================
 set -e
 
-MASTER_IP=${1:?用法: $0 <master_ip> [inspect|install|bench|report|all]}
+MASTER_IP=${1:?用法: $0 <master_ip> [inspect|install|bench|report|all] [bench_mode] [ssh_key_path]}
 ACTION=${2:-all}
 BENCH_MODE=${3:-all}   # 给 bench 子命令用
+# 第 4 个参数当 ssh 私钥用；如果是合法 action（inspect/install/bench/report/all）说明用户跳过了 bench_mode
+# 也支持 SSH_KEY 环境变量
+SSH_KEY="${4:-${SSH_KEY:-}}"
+
+# 兼容：用户在 bench 模式下顺序应该是 ip bench <mode> <key>，其它 action 不需要 bench_mode，
+# 如果 $3 看起来像个文件路径而非 hdfs/cosn/all，则把它当 key
+if [ -z "$SSH_KEY" ] && [ -n "$3" ] && [ "$ACTION" != "bench" ]; then
+  case "$3" in
+    hdfs|cosn|all) : ;;  # 是合法 bench_mode，保持
+    *)
+      # 看起来是路径
+      if [ -f "$3" ] || echo "$3" | grep -qE '\.(pem|key)$|[/\\]'; then
+        SSH_KEY="$3"
+        BENCH_MODE="all"
+      fi
+      ;;
+  esac
+fi
 
 TOOLKIT_DIR_ORIG="$(cd "$(dirname "$0")" && pwd)"
 # 中文路径在 zsh/bash 下 scp 转义会出错，先 tar pipe 到纯英文临时目录
@@ -33,6 +55,11 @@ TOOLKIT_DIR="/tmp/bench-toolkit-local-$$"
 rm -rf "$TOOLKIT_DIR"
 mkdir -p "$TOOLKIT_DIR"
 (cd "$TOOLKIT_DIR_ORIG" && tar cf - .) | (cd "$TOOLKIT_DIR" && tar xf -)
+
+# Windows 下 .sh 行尾是 CRLF，传到 Linux 会报 $'\r': command not found，统一去掉 \r
+# 仅处理常见文本脚本类型（避免误伤 jar/zip 等二进制）
+find "$TOOLKIT_DIR" -type f \( -name '*.sh' -o -name '*.py' -o -name '*.sql' -o -name '*.conf' -o -name '*.properties' -o -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' \) -print0 \
+  | xargs -0 -I{} sed -i 's/\r$//' "{}" 2>/dev/null || true
 
 trap "rm -rf $TOOLKIT_DIR" EXIT
 
@@ -51,8 +78,35 @@ ok()   { echo -e "${GREEN}[oneshot $(date +'%H:%M:%S')] ✓ $*${NC}"; }
 warn() { echo -e "${YELLOW}[oneshot $(date +'%H:%M:%S')] ⚠ $*${NC}"; }
 err()  { echo -e "${RED}[oneshot $(date +'%H:%M:%S')] ✗ $*${NC}"; }
 
-SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 root@$MASTER_IP"
-SCP_OPTS="-o StrictHostKeyChecking=no"
+# ====== 处理 SSH 私钥 ======
+# 把 Windows 风格路径（含反斜杠 / 盘符）转成 Git-Bash 能用的 /c/... 形式
+normalize_key_path() {
+  local p="$1"
+  [ -z "$p" ] && return 0
+  # C:\Users\lkl\... → /c/Users/lkl/...
+  if echo "$p" | grep -qE '^[A-Za-z]:[\\/]'; then
+    local drive
+    drive=$(echo "$p" | cut -c1 | tr 'A-Z' 'a-z')
+    p=$(echo "$p" | sed -E "s|^[A-Za-z]:[\\\\/]|/${drive}/|" | tr '\\' '/')
+  fi
+  echo "$p"
+}
+
+SSH_KEY_OPT=""
+if [ -n "$SSH_KEY" ]; then
+  SSH_KEY=$(normalize_key_path "$SSH_KEY")
+  if [ ! -f "$SSH_KEY" ]; then
+    err "SSH 私钥文件不存在：$SSH_KEY"
+    exit 1
+  fi
+  # OpenSSH 要求私钥权限 ≤ 600，否则拒绝使用
+  chmod 600 "$SSH_KEY" 2>/dev/null || true
+  SSH_KEY_OPT="-i $SSH_KEY -o IdentitiesOnly=yes"
+  log "使用 SSH 私钥登录：$SSH_KEY"
+fi
+
+SSH="ssh $SSH_KEY_OPT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 root@$MASTER_IP"
+SCP_OPTS="$SSH_KEY_OPT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 # 中文路径会被 zsh/bash 转义成 \xxx，scp 解析不了。改用 cd 切换工作目录 + 相对路径
 scp_to()   { (cd "$TOOLKIT_DIR" && scp $SCP_OPTS "$1" "root@$MASTER_IP:$2"); }
 scp_from() { (cd "$TMP_REPORT_DIR" && scp $SCP_OPTS "root@$MASTER_IP:$1" "$2"); }
@@ -64,7 +118,12 @@ test_ssh() {
     ok "SSH 连接 OK"
   else
     err "无法 SSH 到 $MASTER_IP"
-    err "请确保你的公钥 ~/.ssh/id_*.pub 已添加到目标 master 的 /root/.ssh/authorized_keys"
+    if [ -n "$SSH_KEY" ]; then
+      err "请确认私钥 $SSH_KEY 与目标机器 /root/.ssh/authorized_keys 匹配"
+    else
+      err "请确保你的公钥 ~/.ssh/id_*.pub 已添加到目标 master 的 /root/.ssh/authorized_keys"
+      err "或者通过参数提供私钥：$0 <master_ip> all all <ssh_key_path>"
+    fi
     exit 1
   fi
 }

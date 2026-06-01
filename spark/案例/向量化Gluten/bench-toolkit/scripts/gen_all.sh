@@ -2,7 +2,7 @@
 # 5 张表数据生成（按从小到大顺序）
 # 用法：./gen_all.sh [表序号 1-5，省略=全跑]
 set -e
-export JAVA_HOME=/usr/local/jdk
+export JAVA_HOME=/usr/local/jdk-11.0.10
 export PATH=$JAVA_HOME/bin:$PATH
 export SPARK_HOME=/usr/local/service/spark
 export HADOOP_CONF_DIR=/usr/local/service/hadoop/etc/hadoop
@@ -11,20 +11,36 @@ ADD_OPENS="--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.
 
 BENCH_DIR=/home/hadoop/bench
 
+# YARN executor 端 JDK11（EMR 镜像默认在 worker /usr/local/jdk-11.0.10上，无需分发）
+WORKER_JAVA_HOME=${WORKER_JAVA_HOME:-/usr/local/jdk-11.0.10}
+# tcmalloc（只在提交机上有，通过 --files 分发到 executor 容器）
+TCMALLOC_SO=/usr/local/service/spark/meson/libtcmalloc_and_profiler.so
+# driver IP（自动获取本机内网 IP，也可手动覆盖）
+DRIVER_HOST=${DRIVER_HOST:-$(hostname -I | awk '{print $1}')}
+
 run_sql() {
   local label="$1"
   local sql="$2"
   local extra_conf="$3"
   echo "=========== run $label ==========="
   local START=$(date +%s)
+  # 构建 --files 参数（tcmalloc 存在时分发）
+  local FILES_OPT=""
+  local LD_PRELOAD_OPT=""
+  if [ -f "$TCMALLOC_SO" ]; then
+    FILES_OPT="--files $TCMALLOC_SO"
+    LD_PRELOAD_OPT="--conf spark.executorEnv.LD_PRELOAD=./libtcmalloc_and_profiler.so"
+  fi
   $SPARK_HOME/bin/spark-sql \
     --master yarn --deploy-mode client \
     --num-executors 9 --executor-cores 5 --executor-memory 9g --driver-memory 2g --conf spark.executor.memoryOverhead=2g \
-    --conf spark.driver.host=172.21.240.144 \
+    $FILES_OPT \
+    --conf spark.driver.host=${DRIVER_HOST} \
     --conf spark.shuffle.service.enabled=false \
     --conf spark.dynamicAllocation.enabled=false \
-    --conf spark.executorEnv.JAVA_HOME=/usr/local/jdk \
-    --conf spark.yarn.appMasterEnv.JAVA_HOME=/usr/local/jdk \
+    --conf spark.executorEnv.JAVA_HOME=${WORKER_JAVA_HOME} \
+    --conf spark.yarn.appMasterEnv.JAVA_HOME=${WORKER_JAVA_HOME} \
+    $LD_PRELOAD_OPT \
     --conf "spark.driver.extraJavaOptions=$ADD_OPENS" \
     --conf "spark.executor.extraJavaOptions=$ADD_OPENS" \
     --conf spark.eventLog.enabled=false \

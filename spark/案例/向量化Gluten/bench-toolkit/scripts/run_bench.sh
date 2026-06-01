@@ -40,6 +40,9 @@ preflight() {
   ls /usr/local/service/spark/jars/gluten-velox-bundle-*.jar &>/dev/null || \
     { err "Gluten jar 未部署"; exit 1; }
   
+  # Worker JDK11：EMR 镜像默认在 /usr/local/jdk-11.0.10，executor 直接绝对路径引用
+  ok "Worker JDK11 路径：/usr/local/jdk-11.0.10（EMR 镜像自带）"
+  
   # 自动改 DRIVER_HOST 为本机内网 IP
   local IP=$(hostname -I | awk '{print $1}')
   sed -i "s|^DRIVER_HOST=.*|DRIVER_HOST=$IP|" $BENCH_DIR/scripts/*.sh
@@ -101,7 +104,23 @@ run_cosn_setup() {
   fi
   # 改外部表 DDL 的 LOCATION 为当前 COSN_BUCKET
   su - hadoop -c "sed -i 's|cosn://[^\\x27]*/bench|$COSN_BUCKET|g' $BENCH_DIR/external_tables.sql 2>/dev/null || true"
-  su - hadoop -c "hive -f $BENCH_DIR/external_tables.sql" 2>&1 | grep -vE 'SLF4J|^WARN|Logging|illegal|Hive Session' | tail -10
+  # 用 spark-sql 建表（避免 Hive MR 引擎验证失败）
+  export JAVA_HOME=/usr/local/jdk-11.0.10
+  export PATH=$JAVA_HOME/bin:$PATH
+  local ADD_OPENS="--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=jdk.unsupported/sun.misc=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true"
+  su - hadoop -c "export JAVA_HOME=/usr/local/jdk-11.0.10; export PATH=\$JAVA_HOME/bin:\$PATH; /usr/local/service/spark/bin/spark-sql \
+    --master yarn --deploy-mode client \
+    --num-executors 2 --executor-cores 2 --executor-memory 2g --driver-memory 2g \
+    --conf spark.driver.host=$(hostname -I | awk '{print $1}') \
+    --conf spark.executorEnv.JAVA_HOME=/usr/local/jdk-11.0.10 \
+    --conf spark.yarn.appMasterEnv.JAVA_HOME=/usr/local/jdk-11.0.10 \
+    --conf \"spark.driver.extraJavaOptions=$ADD_OPENS\" \
+    --conf \"spark.executor.extraJavaOptions=$ADD_OPENS\" \
+    --conf spark.shuffle.service.enabled=false \
+    --conf spark.dynamicAllocation.enabled=false \
+    --conf spark.eventLog.enabled=false \
+    --conf spark.plugins= \
+    -f $BENCH_DIR/external_tables.sql" 2>&1 | grep -vE 'SLF4J|^WARN|Logging|illegal|Hive Session|HiveConf' | tail -20
   ok "cosn 外部表建好"
   echo
 }

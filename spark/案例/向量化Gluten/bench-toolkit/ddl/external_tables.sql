@@ -8,8 +8,8 @@
 --   3. 适用 Hive 2.3.7（H2）/ Hive 3.1.3（H3）双版本
 -- ====================================================================
 
-CREATE DATABASE IF NOT EXISTS bench;
-USE bench;
+CREATE DATABASE IF NOT EXISTS bench_cosn;
+USE bench_cosn;
 
 DROP TABLE IF EXISTS customers;
 DROP TABLE IF EXISTS products;
