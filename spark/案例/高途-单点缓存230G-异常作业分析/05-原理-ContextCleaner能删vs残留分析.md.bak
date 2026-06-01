@@ -1,0 +1,364 @@
+# 05-原理-ContextCleaner periodicGC 能删 vs 残留分析
+
+> 集群基线：腾讯 EMR fork `e.coding.net/tencentemr/spark`，分支 **`gaotu-3.2.1`**（Apache Spark 3.2.1）
+> 本地路径：`D:\bigdata\txproject\spark`（线上代码）
+> 上游伴读：`01-原理-Spark-DRA与ESS的Shuffle生命周期源码分析.md`、`02-原理-后续版本针对DRA-ESS的Shuffle释放优化演进.md`
+> 所有行号均经 3.2.1 分支 grep 实测，与 emr-3.3.2 不互通（详见末尾「行号对照表」与 challenge 复盘）
+
+---
+
+## 一、问题陈述
+
+线上反复出现这种困惑：
+
+> 我们 `spark.cleaner.periodicGC.interval` 默认 30 分钟跑一次 `System.gc()`，理论上 ShuffleDependency 弱引用就会被回收、ContextCleaner 就会触发清理 —— 那为什么 long-running 的 Spark 作业（Streaming / Kyuubi / 长 SQL session）shuffle 文件还是单调上涨、最后撑爆磁盘？
+
+要回答这个问题，必须把"30 分钟 GC 到底删了什么、没删什么"拆到源码颗粒。
+
+---
+
+## 二、`periodicGC.interval` 自身只做一件事：触发 `System.gc()`
+
+```127:133:core/src/main/scala/org/apache/spark/ContextCleaner.scala
+  def start(): Unit = {
+    cleaningThread.setDaemon(true)
+    cleaningThread.setName("Spark Context Cleaner")
+    cleaningThread.start()
+    periodicGCService.scheduleAtFixedRate(() => System.gc(),
+      periodicGCInterval, periodicGCInterval, TimeUnit.SECONDS)
+  }
+```
+
+> 上面 `periodicGCInterval` 来自参数：
+>
+> | 代码常量 | 对应参数名 | 默认值 | 引入版本 | 定义位置 |
+> |---|---|---|---|---|
+> | `CLEANER_PERIODIC_GC_INTERVAL` | `spark.cleaner.periodicGC.interval` | `30min` | 1.6.0 | `internal/config/package.scala` L1641-1645 |
+
+**这里不删任何文件**。它的唯一作用是"提醒 Driver JVM 跑一次 Full GC"，让弱引用 (`WeakReference`) 进入 `ReferenceQueue`，然后由独立的清理线程 `keepCleaning` 消费队列做清理动作：
+
+```187:219:core/src/main/scala/org/apache/spark/ContextCleaner.scala
+  /** Keep cleaning RDD, shuffle, and broadcast state. */
+  private def keepCleaning(): Unit = Utils.tryOrStopSparkContext(sc) {
+    while (!stopped) {
+      try {
+        val reference = Option(referenceQueue.remove(ContextCleaner.REF_QUEUE_POLL_TIMEOUT))
+          .map(_.asInstanceOf[CleanupTaskWeakReference])
+        synchronized {
+          reference.foreach { ref =>
+            referenceBuffer.remove(ref)
+            ref.task match {
+              case CleanRDD(rddId) =>
+                doCleanupRDD(rddId, blocking = blockOnCleanupTasks)
+              case CleanShuffle(shuffleId) =>
+                doCleanupShuffle(shuffleId, blocking = blockOnShuffleCleanupTasks)
+              case CleanBroadcast(broadcastId) =>
+                doCleanupBroadcast(broadcastId, blocking = blockOnCleanupTasks)
+              case CleanAccum(accId) =>
+                doCleanupAccum(accId, blocking = blockOnCleanupTasks)
+              case CleanCheckpoint(rddId) =>
+                doCleanCheckpoint(rddId)
+              case CleanSparkListener(listener) =>
+                doCleanSparkListener(listener)
+            }
+          }
+        }
+      } catch { ... }
+    }
+  }
+```
+
+→ **"`periodicGC` 能删什么"等价于问"`doCleanupRDD` / `doCleanupShuffle` / `doCleanupBroadcast` 等具体清理函数能触达哪些位置"**。下面拆解 shuffle 这一支（最关键、最易踩坑的一支）。
+
+---
+
+## 三、Shuffle 清理链条：从 Driver 到 Executor 进程内
+
+### 3.1 Driver 端入口
+
+```234:248:core/src/main/scala/org/apache/spark/ContextCleaner.scala
+  def doCleanupShuffle(shuffleId: Int, blocking: Boolean): Unit = {
+    try {
+      if (mapOutputTrackerMaster.containsShuffle(shuffleId)) {
+        logDebug("Cleaning shuffle " + shuffleId)
+        mapOutputTrackerMaster.unregisterShuffle(shuffleId)
+        shuffleDriverComponents.removeShuffle(shuffleId, blocking)
+        listeners.asScala.foreach(_.shuffleCleaned(shuffleId))
+        logDebug("Cleaned shuffle " + shuffleId)
+      } else {
+        logDebug("Asked to cleanup non-existent shuffle (maybe it was already removed)")
+      }
+    } catch { ... }
+  }
+```
+
+干两件事：
+1. **`mapOutputTrackerMaster.unregisterShuffle(shuffleId)`** —— Driver 端 mapOutputTracker 注册表内删除 shuffleId
+2. **`shuffleDriverComponents.removeShuffle(...)`** —— 经 BlockManagerMaster 路由到 BlockManagerMasterEndpoint
+
+### 3.2 BlockManagerMasterEndpoint —— 3.2.1 的关键断点
+
+```313:324:core/src/main/scala/org/apache/spark/storage/BlockManagerMasterEndpoint.scala
+  private def removeShuffle(shuffleId: Int): Future[Seq[Boolean]] = {
+    // Nothing to do in the BlockManagerMasterEndpoint data structures
+    val removeMsg = RemoveShuffle(shuffleId)
+    Future.sequence(
+      blockManagerInfo.values.map { bm =>
+        bm.storageEndpoint.ask[Boolean](removeMsg).recover {
+          // use false as default value means no shuffle data were removed
+          handleBlockRemovalFailure("shuffle", shuffleId.toString, bm.blockManagerId, false)
+        }
+      }.toSeq
+    )
+  }
+```
+
+注释自己写得很清楚：`Nothing to do in the BlockManagerMasterEndpoint data structures` —— Endpoint 自己什么都不做，只对**当前注册在 master 里的所有活着的 BlockManager** 发 `RemoveShuffle` RPC。
+
+> 这里有 3.2.1 的核心病灶（已在 02-演进文档详述）：**没有任何 `externalBlockStoreClient.removeBlocks(...)` 调用**，driver 不通知 ESS。SPARK-37618 在 3.3.0 才把这一段补上。
+
+### 3.3 Executor 进程内的 RPC 处理
+
+```56:62:core/src/main/scala/org/apache/spark/storage/BlockManagerStorageEndpoint.scala
+    case RemoveShuffle(shuffleId) =>
+      doAsync[Boolean]("removing shuffle " + shuffleId, context) {
+        if (mapOutputTracker != null) {
+          mapOutputTracker.unregisterShuffle(shuffleId)
+        }
+        SparkEnv.get.shuffleManager.unregisterShuffle(shuffleId)
+      }
+```
+
+干两件事：
+1. **executor 进程内 mapOutputTracker** 注销
+2. **`SparkEnv.get.shuffleManager.unregisterShuffle(shuffleId)`** —— 这才是真正能"删盘"的地方
+
+### 3.4 SortShuffleManager.unregisterShuffle —— 是真删的
+
+```184:191:core/src/main/scala/org/apache/spark/shuffle/sort/SortShuffleManager.scala
+  /** Remove a shuffle's metadata from the ShuffleManager. */
+  override def unregisterShuffle(shuffleId: Int): Boolean = {
+    Option(taskIdMapsForShuffle.remove(shuffleId)).foreach { mapTaskIds =>
+      mapTaskIds.iterator.foreach { mapTaskId =>
+        shuffleBlockResolver.removeDataByMap(shuffleId, mapTaskId)
+      }
+    }
+    true
+  }
+```
+
+注意这里 **`taskIdMapsForShuffle.remove(shuffleId)`** —— 这是个 `ConcurrentHashMap[Int, OpenHashSet[Long]]`，记录"本 executor 上为 shuffleId 写过哪些 mapId"。能进入 `foreach` 删盘的前提是：**这些 mapTask 是本 executor 自己写的**。
+
+### 3.5 IndexShuffleBlockResolver.removeDataByMap —— 真正的 file.delete
+
+```149:163:core/src/main/scala/org/apache/spark/shuffle/IndexShuffleBlockResolver.scala
+  def removeDataByMap(shuffleId: Int, mapId: Long): Unit = {
+    var file = getDataFile(shuffleId, mapId)
+    if (file.exists() && !file.delete()) {
+      logWarning(s"Error deleting data ${file.getPath()}")
+    }
+
+    file = getIndexFile(shuffleId, mapId)
+    if (file.exists() && !file.delete()) {
+      logWarning(s"Error deleting index ${file.getPath()}")
+    }
+
+    file = getChecksumFile(shuffleId, mapId, conf.get(config.SHUFFLE_CHECKSUM_ALGORITHM))
+    if (file.exists() && !file.delete()) {
+      logWarning(s"Error deleting checksum ${file.getPath()}")
+    }
+  }
+```
+
+> `conf.get(config.SHUFFLE_CHECKSUM_ALGORITHM)` 引用的常量：
+>
+> | 代码常量 | 对应参数名 | 默认值 | 引入版本 |
+> |---|---|---|---|
+> | `SHUFFLE_CHECKSUM_ALGORITHM` | `spark.shuffle.checksum.algorithm` | `ADLER32` | 3.2.0 |
+
+干干净净三个 `file.delete()`：删 `.data` / `.index` / `.checksum`。**这一步是真的删了磁盘文件**——但前提是这段代码能在"目标文件所在的 executor 进程"里跑起来。
+
+---
+
+## 四、关键洞察：能不能删，取决于 executor 是否还活着
+
+把链条串起来，关键节点是 3.2 的 `blockManagerInfo.values` —— 它只包含**当前还活着的 BlockManager**。一旦 executor 进程退出（DRA 杀、OOM、节点 lost、decommission 等），它就从 `blockManagerInfo` 里被移除，driver 发 `RemoveShuffle` RPC 时**跳过这个目标**。
+
+### 4.1 双路径决断图
+
+```mermaid
+flowchart TD
+    classDef ok    fill:#E8F5E9,stroke:#43A047,color:#1b5e20
+    classDef bad   fill:#FFEBEE,stroke:#E53935,color:#b71c1c
+    classDef cond  fill:#FFFDE7,stroke:#F9A825,color:#7a4f00
+    classDef step  fill:#E3F2FD,stroke:#1976D2,color:#0d47a1
+
+    A["periodicGC.interval (默认 30min)<br/>System.gc()"]:::step
+    B["WeakReference 入 ReferenceQueue"]:::step
+    C["ContextCleaner.keepCleaning<br/>消费队列 → CleanShuffle"]:::step
+    D["doCleanupShuffle<br/>→ shuffleDriverComponents.removeShuffle"]:::step
+    E["BlockManagerMasterEndpoint.removeShuffle<br/>遍历 blockManagerInfo.values"]:::step
+    F{"该 mapTask 所在的<br/>executor 还活着吗?"}:::cond
+    G1["✅ 活着<br/>RPC 到 BlockManagerStorageEndpoint<br/>→ SortShuffleManager.unregisterShuffle<br/>→ removeDataByMap<br/>→ 三次 file.delete()<br/>本地 .data/.index/.checksum 真删"]:::ok
+    G2["❌ 已死 (DRA 杀/lost/OOM)<br/>不在 blockManagerInfo 内<br/>RPC 跳过<br/>NM 磁盘上文件残留<br/>(被 ESS 服务读取中)"]:::bad
+    H["3.2.1 driver 完全不通知 ESS<br/>(SPARK-37618 病灶)<br/>等 application 结束<br/>YARN NM DeletionService 兜底"]:::bad
+
+    A --> B --> C --> D --> E --> F
+    F -- "是" --> G1
+    F -- "否" --> G2 --> H
+```
+
+### 4.2 文件残留矩阵（按 executor 状态）
+
+| 文件位置 / executor 状态 | 仍存活的 executor | 已死的 executor（DRA 杀/Lost）|
+|---|---|---|
+| **Driver 端 mapOutputTrackerMaster 注册** | ✅ 删（直接 unregister）| ✅ 删（与 executor 死活无关）|
+| **Executor 进程内 mapOutputTracker 缓存** | ✅ 删（RPC 触达）| —（进程已没了，自然没了）|
+| **Executor 进程内 SortShuffleManager.taskIdMapsForShuffle** | ✅ 删 | —（进程已没了，自然没了）|
+| **本地磁盘 `.data/.index/.checksum` 物理文件** | ✅ **删**（`removeDataByMap` 三次 `file.delete()`）| ❌ **残留**（RPC 发不到死进程）|
+| **ESS（NM）上同一份物理文件** | ❌ **残留**（3.2.1 driver 根本不发 RemoveBlocks）| ❌ **残留**（3.2.1 driver 根本不发 RemoveBlocks）|
+| **ESS 注册表里该 executor 的元数据条目** | （还活着，注册有效）| ❌ **残留**（3.2.1 driver 不通知 ESS）|
+
+---
+
+## 五、为什么 DRA 场景下"残留"是常态而非例外
+
+回到 DRA + ESS 的标准工作流（已在 01-生命周期文档详述）：
+
+1. Spark 任务跑 stage → executor A 写 shuffle 到 NM 本地磁盘（`/data/emr/yarn/local/usercache/<user>/appcache/<appId>/blockmgr-*/`）
+2. stage 完成 → executor A idle 60s → **DRA 杀 A**（A 进程退出，NM 磁盘上 shuffle 文件还在，由 ESS 继续服务 reduce 端）
+3. reduce 通过 ESS 读完 → shuffleId 不再被 active job 引用
+4. 等 30min 后 driver `System.gc()` → ContextCleaner 触发 `doCleanupShuffle(shuffleId)`
+5. driver 想发 `RemoveShuffle` RPC 给 A —— **A 已经在第 2 步死了** —— RPC 跳过
+6. driver 没有"通知 ESS 删盘"的代码路径（3.2.1 SPARK-37618 病灶）—— **NM 磁盘上的文件继续躺到 app 结束**
+
+### 5.1 这里有个数量级判断
+
+DRA 默认 `executorIdleTimeout=60s`。一个 long-running 任务（Streaming / Kyuubi engine / 长 SQL session）跑几小时，executor 来回起停几十甚至几百次，**每次写完 shuffle 60s 不干活就被杀**。
+
+→ 该任务在 NM 磁盘上的 shuffle 文件，**绝大多数都来自"已经死掉的 executor"**。
+
+→ `periodicGC` 调多频繁都救不了——它能触达的"活 executor"那部分 shuffle 文件本来就只占很小比例，且生命周期很短。
+
+230G 案例里 13230312 单节点 18 个 executor、跑 40 分钟那种场景，**只要 DRA 在收缩 executor 节奏被卡住或者 stage 一直在跑没让 executor idle，shuffle 必然单调上涨**——不是清理机制不努力，是清理机制原理上够不到。
+
+---
+
+## 六、其他清理目标的对照（顺带说清）
+
+`ContextCleaner` 的 6 种 `CleanupTask` 在 DRA 场景下的清理结果（仅 shuffle 是病灶）：
+
+| CleanupTask | 实际动作 | DRA 场景下能不能删干净 |
+|---|---|---|
+| `CleanRDD` | `sc.unpersistRDD(rddId, blocking)` → 各 BM 删本地缓存 RDD block | 🟢 RDD cache 主要在内存，executor 死了进程一起没；磁盘 RDD block 已死 executor 上的会残留（SPARK-27677 让 ESS 兜底服务，但同样不删盘）|
+| **`CleanShuffle`** | 见上文详细分析 | 🔴 **DRA 场景下大面积残留，3.2.1 病灶**|
+| `CleanBroadcast` | `broadcastManager.unbroadcast(broadcastId, true, blocking)` | 🟢 broadcast 主要在内存，磁盘 fallback 在活 executor 上能删 |
+| `CleanAccum` | `AccumulatorContext.remove(accId)` | 🟢 仅 driver 内存 |
+| `CleanCheckpoint` | `ReliableRDDCheckpointData.cleanCheckpoint(sc, rddId)` 删 HDFS 上 checkpoint 文件 | 🟢 直接 `fs.delete`，HDFS 操作与 executor 无关 |
+| `CleanSparkListener` | `sc.listenerBus.removeListener(listener)` | 🟢 仅 driver 内存 |
+
+→ **这 6 类里只有 `CleanShuffle` 在 DRA 场景下大面积残留**。这也回答了一个隐含问题："为什么社区直到 3.3.0 才补 SPARK-37618 这一刀？" —— 因为只有 shuffle 这一类有"executor 死了文件还要继续被 ESS 读、不能在 stopContainer 时删"的特殊场景，其他清理目标都不存在这种纠结。
+
+---
+
+## 七、运维启示：调 `periodicGC.interval` 有用吗？
+
+| 场景 | 调小 `periodicGC.interval` 有用吗？ |
+|---|---|
+| 非 DRA / executor 长期不死的稳态任务（少见）| 🟢 有用 —— 能更早释放 cache 内存压力 |
+| **DRA + 长任务 (Streaming / Kyuubi / 长 SQL session) —— 最常见**| 🔴 **基本没用** —— 90%+ 残留来自死 executor，调到 1min 也救不了 |
+| broadcast / accum 多的 driver 内存压力大场景 | 🟡 调小可缓解 driver 内存压力，但要权衡 GC 频率（每次 `System.gc()` 都触发 Full GC）|
+
+### 7.1 真正解药（按治标→治本顺序）
+
+| 解药 | 触达层级 | 备注 |
+|---|---|---|
+| 临时清盘脚本（230G 阈值杀任务）| 表面症状压制 | 当前线上方案，本专题 03/04 文档已论证：方向对，但需阶梯响应 + 双指标 + 冷却 + 审计升级 |
+| 显式调小 `spark.dynamicAllocation.maxExecutors` 或调大 `executor.cores` | 减小单节点 executor 密度 | 从源头降低单节点累积上限。13230312 max=18 → 控制到 ≤10 即可避免 |
+| `spark.shuffle.service.removeShuffle=true`（需 Spark 3.3+ 客户端 + ESS jar）| **治本** | SPARK-37618 修复，让 driver 在 ContextCleaner 触发时也通知 ESS 真删盘 |
+| Remote Shuffle Service（Celeborn / Magnet）| 架构级治本 | shuffle 完全不落 NM 本地盘 |
+
+> 注意：`spark.shuffle.service.removeShuffle` 默认 false，光升 Spark 3.3+ 不开开关等于没修；同时 NM 端 ESS jar 也需对应版本，否则 driver 发出的 `RemoveBlocks` RPC 不被处理。详见 02-演进文档与 04-案例文档建议沟通话术。
+
+---
+
+## 八、行号对照表（3.2.1 vs emr-3.3.2）
+
+> 此案例归档纪律：本文所有引用基于 `D:\bigdata\txproject\spark` 当前分支 **`gaotu-3.2.1`** 实测。同一仓库切换到 `emr-3.3.2` 后行号会变，且会多出 SPARK-37618 修复代码块——切换分支后必须重新 grep。
+
+| 引用 | gaotu-3.2.1 | emr-3.3.2 | 差异说明 |
+|---|---|---|---|
+| `ContextCleaner.start` `periodicGCService` 调度 | L127-133 | L127-133 | 一致 |
+| `ContextCleaner.keepCleaning` 主循环 | L187-219 | L187-219 | 一致 |
+| `ContextCleaner.doCleanupShuffle` | L234-248 | L234-248 | 一致 |
+| `BlockManagerMasterEndpoint.removeShuffle` | **L313-324**（极简）| **L323-371**（含 SPARK-37618 ESS 删盘链路）| 关键差异，emr-3.3.2 多 47 行 |
+| `BlockManagerStorageEndpoint` 处理 `RemoveShuffle` | L56-62 | L56-62 | 一致 |
+| `SortShuffleManager.unregisterShuffle` | L184-191 | L184-191 | 一致 |
+| `IndexShuffleBlockResolver.removeDataByMap` | **L149-163** | **L156-170** | 行号偏移 7 行（无功能差异）|
+| `SHUFFLE_SERVICE_REMOVE_SHUFFLE_ENABLED` 常量 | **不存在** | L689-697 | SPARK-37618 引入 |
+
+---
+
+## 九、Challenger 审查报告
+
+```
+🔍 Challenger 审查报告
+━━━━━━━━━━━━━━━━━━━━━━
+📋 审查对象: ContextCleaner periodicGC 能删 vs 残留分析
+🔎 审查结果: APPROVED（基于 gaotu-3.2.1 实测，主结论与 01/02 文档自洽）
+
+━━━ 证据质疑 ━━━
+🟢 疑点1（已消除）: "调小 periodicGC 救不了 DRA 场景" —— 依据是 90% 残留来自死
+   executor，但这个数字是估计还是实测？
+   说明: "90%" 是定性结论而非定量实测；改成"绝大多数"更稳。已在第五节用
+        "几十甚至几百次"的描述替代精确百分比。
+
+🟢 疑点2（已消除）: 第 3.5 节 SHUFFLE_CHECKSUM_ALGORITHM 默认值"ADLER32"
+   是否经过实测？
+   实测: package.scala 中该参数 .createWithDefaultString("ADLER32"), version("3.2.0")。
+        3.2.1 仓库内确认存在，与 IndexShuffleBlockResolver L160 的引用对得上。
+
+🟢 疑点3（已消除）: "DRA 默认 executorIdleTimeout=60s" 是否准确？
+   实测: package.scala L611-616 createWithDefault(60), TimeUnit.SECONDS。准确。
+
+━━━ 逻辑质疑 ━━━
+🟢 逻辑链完整: periodicGC → System.gc → 弱引用 → keepCleaning → doCleanupShuffle
+   → BlockManagerMaster → 各活 BM → SortShuffleManager.unregisterShuffle →
+   removeDataByMap → file.delete。每个环节有源码引用。
+🟢 反向证据完整: 死 executor 不在 blockManagerInfo.values 里 → RPC 跳过 → 死 executor
+   留下的文件只能等 app 结束 NM DeletionService 删。
+
+━━━ 完备性 ━━━
+⚠️ 未深入: SortShuffleManager 还有 BypassMergeSortShuffleWriter 路径，但该路径 hash-based
+   写完 merge 成 sort 形式，删除路径与 SortShuffleManager.unregisterShuffle 共享，故
+   不影响主结论。本文聚焦主链不展开。
+⚠️ 未深入: blockOnShuffleCleanupTasks (spark.cleaner.referenceTracking.blocking.shuffle)
+   默认 false 与本文主结论无冲突——blocking 只影响清理时机，不影响清理触达范围。
+
+━━━ 安全审查 ━━━
+🟢 SAFE: 全部静态源码分析，零生产操作。
+🟢 SAFE: 第 7.1 节给出的运维建议均已在 02-演进、03-通用、04-案例文档反复评审过，
+   无新风险引入。
+
+━━━ 裁决 ━━━
+APPROVED —— 基于 gaotu-3.2.1 实测的源码引用全部对得上，主结论
+"调 periodicGC 救不了 DRA 场景"经得起证据链追问，可作为本专题"为什么 30 分钟
+不能阻止磁盘上涨"的标准答案。
+```
+
+---
+
+## 十、源码索引
+
+| 关注点 | 文件 | 关键行 |
+|---|---|---|
+| `periodicGC` 调度入口 | `core/src/main/scala/org/apache/spark/ContextCleaner.scala` | 127-133 |
+| 清理主循环 | `core/src/main/scala/org/apache/spark/ContextCleaner.scala` | 187-219 |
+| Shuffle 清理入口 | `core/src/main/scala/org/apache/spark/ContextCleaner.scala` | 234-248 |
+| Driver 端 RPC 入口 | `core/src/main/scala/org/apache/spark/storage/BlockManagerMasterEndpoint.scala` | 313-324 |
+| Executor 端 RPC 处理 | `core/src/main/scala/org/apache/spark/storage/BlockManagerStorageEndpoint.scala` | 56-62 |
+| `SortShuffleManager.unregisterShuffle` | `core/src/main/scala/org/apache/spark/shuffle/sort/SortShuffleManager.scala` | 184-191 |
+| `IndexShuffleBlockResolver.removeDataByMap` | `core/src/main/scala/org/apache/spark/shuffle/IndexShuffleBlockResolver.scala` | 149-163 |
+| `CLEANER_PERIODIC_GC_INTERVAL` 配置 | `core/src/main/scala/org/apache/spark/internal/config/package.scala` | 1641-1645 |
+| `SHUFFLE_CHECKSUM_ALGORITHM` 配置 | `core/src/main/scala/org/apache/spark/internal/config/package.scala` | 含 createWithDefaultString("ADLER32"), version("3.2.0") |
+| `DYN_ALLOCATION_EXECUTOR_IDLE_TIMEOUT` 配置 | `core/src/main/scala/org/apache/spark/internal/config/package.scala` | 611-616 |

@@ -1,0 +1,249 @@
+[prepare][15:57:13] === Step 1/3 : 数据存在性 + 大小盘点 ===
+[prepare][15:57:13] ---- customers : cosn://lkl-bj-update-1308597516/meson/data/bench/customers ----
+1.1 G  cosn://lkl-bj-update-1308597516/meson/data/bench/customers
+[prepare][15:57:15] ---- products : cosn://lkl-bj-update-1308597516/meson/data/bench/products ----
+407.5 M  cosn://lkl-bj-update-1308597516/meson/data/bench/products
+[prepare][15:57:17] ---- reviews : cosn://lkl-bj-update-1308597516/meson/data/bench/reviews ----
+3.0 G  cosn://lkl-bj-update-1308597516/meson/data/bench/reviews
+[prepare][15:57:19] ---- orders : cosn://lkl-bj-update-1308597516/meson/data/bench/orders ----
+8.2 G  cosn://lkl-bj-update-1308597516/meson/data/bench/orders
+[prepare][15:57:21] ---- order_items : cosn://lkl-bj-update-1308597516/meson/data/bench/order_items ----
+79.1 G  cosn://lkl-bj-update-1308597516/meson/data/bench/order_items
+[prepare][15:57:23] [OK] 5 张表数据全部就位
+[prepare][15:57:23] === Step 2/3 : 创建 bench_cosn 库 + 5 张外部表 ===
+[prepare][15:57:23] use hive -f /home/hadoop/bench-101/external_tables_meson.sql
+which: no hbase in (/usr/local/jdk/bin:/usr/local/service/hive/bin:/usr/local/service/spark/bin:/usr/local/service/spark/sbin:/usr/local/service/hadoop/bin:/usr/local/service/hadoop/sbin:/usr/local/service/tez/bin:/usr/local/jdk/bin:/usr/local/service/hadoop/bin:/usr/local/service/hive/bin:/usr/local/service/hbase/bin:/usr/local/service/spark/bin:/usr/local/service/storm/bin:/usr/local/service/sqoop/bin:/usr/local/service/kylin/bin:/usr/local/service/alluxio/bin:/usr/local/service/flink/bin:/data/Impala/bin:/usr/local/service/oozie/bin:/usr/local/service/presto/bin:/usr/local/service/slider/bin:/usr/local/service/kudu/bin:/usr/local/jdk//bin:/usr/local/bin:/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/home/hadoop/.local/bin:/home/hadoop/bin)
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/usr/local/service/hive/lib/log4j-slf4j-impl-2.17.1.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/usr/local/service/hive/spark/jars/slf4j-log4j12-1.7.30.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/usr/local/service/tez/lib/slf4j-log4j12-1.7.10.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/usr/local/service/hadoop/share/hadoop/common/lib/slf4j-log4j12-1.7.10.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [org.apache.logging.slf4j.Log4jLoggerFactory]
+
+Logging initialized using configuration in file:/usr/local/service/hive/conf/hive-log4j2.properties Async: true
+OK
+Time taken: 1.176 seconds
+OK
+Time taken: 0.017 seconds
+OK
+Time taken: 0.183 seconds
+OK
+Time taken: 0.112 seconds
+OK
+Time taken: 0.083 seconds
+OK
+Time taken: 0.125 seconds
+OK
+Time taken: 0.113 seconds
+OK
+Time taken: 1.259 seconds
+OK
+Time taken: 0.481 seconds
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 5  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:57:29] ---- count(*) products ----
+OK
+Time taken: 0.29 seconds
+OK
+Time taken: 0.291 seconds
+OK
+Time taken: 0.518 seconds
+OK
+customers
+order_items
+orders
+products
+reviews
+Time taken: 0.088 seconds, Fetched: 5 row(s)
+WARNING: Hive-on-MR is deprecated in Hive 2 and may not be available in the future versions. Consider using a different execution engine (i.e. spark, tez) or using Hive 1.X releases.
+Query ID = hadoop_20260525155730_410366f5-a858-4420-aa0d-c5cd5104b422
+Total jobs = 1
+Launching Job 1 out of 1
+Number of reduce tasks determined at compile time: 1
+In order to change the average load for a reducer (in bytes):
+  set hive.exec.reducers.bytes.per.reducer=<number>
+In order to limit the maximum number of reducers:
+  set hive.exec.reducers.max=<number>
+In order to set a constant number of reducers:
+  set mapreduce.job.reduces=<number>
+Starting Job = job_1779692761850_0006, Tracking URL = http://172.21.240.219:5004/proxy/application_1779692761850_0006/
+Kill Command = /usr/local/service/hadoop/bin/hadoop job  -kill job_1779692761850_0006
+Hadoop job information for Stage-1: number of mappers: 5; number of reducers: 1
+2026-05-25 15:57:35,987 Stage-1 map = 0%,  reduce = 0%
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 2  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:57:40] ---- count(*) reviews ----
+2026-05-25 15:57:50,387 Stage-1 map = 100%,  reduce = 100%
+Ended Job = job_1779692761850_0006 with errors
+Error during job, obtaining debugging information...
+Examining task ID: task_1779692761850_0006_m_000001 (and more) from job job_1779692761850_0006
+Examining task ID: task_1779692761850_0006_m_000001 (and more) from job job_1779692761850_0006
+
+Task with the most failures(4): 
+-----
+Task ID:
+  task_1779692761850_0006_m_000001
+
+URL:
+  http://172.21.240.219:5004/taskdetails.jsp?jobid=job_1779692761850_0006&tipid=task_1779692761850_0006_m_000001
+-----
+Diagnostic Messages for this Task:
+Error: java.io.IOException: java.lang.reflect.InvocationTargetException
+	at org.apache.hadoop.hive.io.HiveIOExceptionHandlerChain.handleRecordReaderCreationException(HiveIOExceptionHandlerChain.java:97)
+	at org.apache.hadoop.hive.io.HiveIOExceptionHandlerUtil.handleRecordReaderCreationException(HiveIOExceptionHandlerUtil.java:57)
+	at org.apache.hadoop.hive.shims.HadoopShimsSecure$CombineFileRecordReader.initNextRecordReader(HadoopShimsSecure.java:271)
+	at org.apache.hadoop.hive.shims.HadoopShimsSecure$CombineFileRecordReader.<init>(HadoopShimsSecure.java:217)
+	at org.apache.hadoop.hive.shims.HadoopShimsSecure$CombineFileInputFormatShim.getRecordReader(HadoopShimsSecure.java:345)
+	at org.apache.hadoop.hive.ql.io.CombineHiveInputFormat.getRecordReader(CombineHiveInputFormat.java:695)
+	at org.apache.hadoop.mapred.MapTask$TrackedRecordReader.<init>(MapTask.java:169)
+	at org.apache.hadoop.mapred.MapTask.runOldMapper(MapTask.java:432)
+	at org.apache.hadoop.mapred.MapTask.run(MapTask.java:343)
+	at org.apache.hadoop.mapred.YarnChild$2.run(YarnChild.java:175)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:422)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1844)
+	at org.apache.hadoop.mapred.YarnChild.main(YarnChild.java:169)
+Caused by: java.lang.reflect.InvocationTargetException
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:62)
+	at sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+	at java.lang.reflect.Constructor.newInstance(Constructor.java:423)
+	at org.apache.hadoop.hive.shims.HadoopShimsSecure$CombineFileRecordReader.initNextRecordReader(HadoopShimsSecure.java:257)
+	... 11 more
+Caused by: org.apache.parquet.io.ParquetDecodingException: Can not read value at 1 in block 0 in file cosn://lkl-bj-update-1308597516/meson/data/bench/customers/part-00028-1eae5c67-8faf-49ea-889f-89612b1b885d-c000.snappy.parquet
+	at org.apache.parquet.hadoop.InternalParquetRecordReader.nextKeyValue(InternalParquetRecordReader.java:243)
+	at org.apache.parquet.hadoop.ParquetRecordReader.nextKeyValue(ParquetRecordReader.java:227)
+	at org.apache.hadoop.hive.ql.io.parquet.read.ParquetRecordReaderWrapper.<init>(ParquetRecordReaderWrapper.java:98)
+	at org.apache.hadoop.hive.ql.io.parquet.read.ParquetRecordReaderWrapper.<init>(ParquetRecordReaderWrapper.java:60)
+	at org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat.getRecordReader(MapredParquetInputFormat.java:75)
+	at org.apache.hadoop.hive.ql.io.CombineHiveRecordReader.<init>(CombineHiveRecordReader.java:99)
+	... 16 more
+Caused by: java.lang.UnsupportedOperationException: org.apache.hadoop.hive.ql.io.parquet.convert.ETypeConverter$8$1
+	at org.apache.parquet.io.api.PrimitiveConverter.addLong(PrimitiveConverter.java:108)
+	at org.apache.parquet.column.impl.ColumnReaderImpl$2$4.writeValue(ColumnReaderImpl.java:274)
+	at org.apache.parquet.column.impl.ColumnReaderImpl.writeCurrentValueToConverter(ColumnReaderImpl.java:371)
+	at org.apache.parquet.io.RecordReaderImplementation.read(RecordReaderImplementation.java:405)
+	at org.apache.parquet.hadoop.InternalParquetRecordReader.nextKeyValue(InternalParquetRecordReader.java:218)
+	... 21 more
+
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 5  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:57:51] [fallback] hive failed or missing, try spark-sql -f
+2026-05-25 15:57:53,049 [WARN] [main] HiveConf of name hive.metastore.db.encoding does not exist (org.apache.hadoop.hive.conf.HiveConf(org.apache.hadoop.hive.conf.HiveConf.initialize:4116))
+2026-05-25 15:57:53,051 [WARN] [main] HiveConf of name hive.server2.materializedviews.registry.impl does not exist (org.apache.hadoop.hive.conf.HiveConf(org.apache.hadoop.hive.conf.HiveConf.initialize:4116))
+2026-05-25 15:57:53,052 [WARN] [main] HiveConf of name hive.hwi.listen.host does not exist (org.apache.hadoop.hive.conf.HiveConf(org.apache.hadoop.hive.conf.HiveConf.initialize:4116))
+2026-05-25 15:57:53,052 [WARN] [main] HiveConf of name hive.hwi.listen.port does not exist (org.apache.hadoop.hive.conf.HiveConf(org.apache.hadoop.hive.conf.HiveConf.initialize:4116))
+Time taken: 1.117 seconds
+Time taken: 0.022 seconds
+Time taken: 1.766 seconds
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 2  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:57:58] ---- count(*) reviews ----
+Time taken: 0.559 seconds
+Time taken: 0.564 seconds
+Time taken: 0.528 seconds
+Time taken: 0.683 seconds
+2026-05-25 15:58:00,638 [WARN] [main] METASTORE_FILTER_HOOK will be ignored, since hive.security.authorization.manager is set to instance of HiveAuthorizerFactory. (org.apache.hadoop.hive.ql.session.SessionState(org.apache.hadoop.hive.ql.session.SessionState.setAuthorizerV2Config:907))
+Time taken: 0.474 seconds
+Time taken: 0.572 seconds
+Time taken: 0.43 seconds
+Time taken: 0.591 seconds
+Time taken: 0.502 seconds
+bench_cosn	customers	false
+bench_cosn	order_items	false
+bench_cosn	orders	false
+bench_cosn	products	false
+bench_cosn	reviews	false
+Time taken: 0.287 seconds, Fetched 5 row(s)
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 11  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:58:08] ---- count(*) orders ----
+customers	50000000
+Time taken: 12.884 seconds, Fetched 1 row(s)
+products	10000000
+Time taken: 5.027 seconds, Fetched 1 row(s)
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 11  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:58:28] ---- count(*) orders ----
+reviews	150000000
+Time taken: 15.384 seconds, Fetched 1 row(s)
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 32  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:58:37] ---- count(*) order_items ----
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 32  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:58:59] ---- count(*) order_items ----
+orders	400000000
+Time taken: 29.721 seconds, Fetched 1 row(s)
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 267  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:59:12] === DONE，inventory: /home/hadoop/bench-101/data_inventory.txt ===
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 267  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][15:59:31] === DONE，inventory: /home/hadoop/bench-101/data_inventory.txt ===
+order_items	2400000000
+Time taken: 244.672 seconds, Fetched 1 row(s)
+[prepare][16:03:11] [OK] 外部表创建完成
+[prepare][16:03:11] === Step 3/3 : 行数抽检 select count(*) ===
+[prepare][16:03:11] ---- count(*) customers ----
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 5  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][16:03:38] ---- count(*) products ----
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 2  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][16:04:07] ---- count(*) reviews ----
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 11  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][16:04:34] ---- count(*) orders ----
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 32  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][16:05:02] ---- count(*) order_items ----
+
+FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+MapReduce Jobs Launched: 
+Stage-Stage-1: Map: 267  Reduce: 1   HDFS Read: 0 HDFS Write: 0 FAIL
+Total MapReduce CPU Time Spent: 0 msec
+[prepare][16:05:32] === DONE，inventory: /home/hadoop/bench-101/data_inventory.txt ===

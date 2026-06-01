@@ -1,0 +1,41 @@
+{
+  "hostname": "172.21.240.154",
+  "master_ip": "172.21.240.154",
+  "system_java": {
+    "path": "/usr/lib/jvm/TencentKona-8.0.9-322/jre/bin/java",
+    "version": "1.8.0_322"
+  },
+  "jdk11": {
+    "path": "",
+    "installed": false,
+    "need_install": true
+  },
+  "hadoop": {
+    "version": "2.8.5"
+  },
+  "hive": {
+    "version": "2.3.7"
+  },
+  "spark": {
+    "home": "/usr/local/service/spark",
+    "version": "3.0.2",
+    "need_install": true
+  },
+  "gluten": {
+    "jar": "",
+    "version": "none",
+    "need_install": true
+  },
+  "yarn": {
+    "workers": "172.21.240.245,172.21.240.39",
+    "worker_count": 2,
+    "total_resource": "memory:14746, vCores:4",
+    "worker_ssh": "false"
+  },
+  "cosn": {
+    "available": true
+  },
+  "bench": {
+    "deployed": false
+  }
+}

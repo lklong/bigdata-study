@@ -1,0 +1,4 @@
+query,seconds,application_id
+q1_agg,41,
+q2_join_2tables,45,
+q3_join_3tables,341,
