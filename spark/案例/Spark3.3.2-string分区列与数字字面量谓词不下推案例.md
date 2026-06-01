@@ -441,36 +441,93 @@ Filter (isnotnull(dt#58) AND (dt#58 = 20260601))
 
 ### 5.4 金标准实测：HiveCatalogMetrics.METRIC_PARTITIONS_FETCHED
 
+#### 5.4.1 关于该 metric 的性质（必读）
+
+`HiveCatalogMetrics.METRIC_PARTITIONS_FETCHED` 是 codahale `Counter`，**单调递增累加，不会自动 reset**：
+
+> ```70:99:core/src/main/scala/org/apache/spark/metrics/source/StaticSources.scala
+>   val METRIC_PARTITIONS_FETCHED = metricRegistry.counter(MetricRegistry.name("partitionsFetched"))
+>   ...
+>   def reset(): Unit = {
+>     METRIC_PARTITIONS_FETCHED.dec(METRIC_PARTITIONS_FETCHED.getCount())
+>     ...
+>   }
+> ```
+
+> ```105:105:core/src/main/scala/org/apache/spark/metrics/source/StaticSources.scala
+>   def incrementFetchedPartitions(n: Int): Unit = METRIC_PARTITIONS_FETCHED.inc(n)
+> ```
+
+只在 `HiveClientImpl` 两处被累加：
+
+> ```770:786:sql/hive/src/main/scala/org/apache/spark/sql/hive/client/HiveClientImpl.scala
+>     val parts = shim.getPartitions(client, hiveTable, partSpec.asJava).map(fromHivePartition)
+>     HiveCatalogMetrics.incrementFetchedPartitions(parts.length)
+>     parts.toSeq
+>   }
+>
+>   override def getPartitionsByFilter(
+>       rawHiveTable: RawHiveTable,
+>       predicates: Seq[Expression]): Seq[CatalogTablePartition] = withHiveState {
+>     ...
+>     val parts =
+>       shim.getPartitionsByFilter(client, hiveTable, predicates, rawHiveTable.toCatalogTable)
+>         .map(fromHivePartition)
+>     HiveCatalogMetrics.incrementFetchedPartitions(parts.length)
+>     parts
+>   }
+> ```
+
+| 调用点 | 触发场景 |
+|---|---|
+| `HiveClientImpl.getPartitions` L772 | 物理执行阶段取裁剪后分区详细元数据 |
+| `HiveClientImpl.getPartitionsByFilter` L784 | **逻辑优化阶段 PruneHiveTablePartitions 触发的下推/降级路径**（本案例关心的就是它） |
+
+**两点正确用法**：
+1. 看**增量** `delta = b1 - b0`，不要看绝对值
+2. 多次连跑测试前**必须 `HiveCatalogMetrics.reset()`** 显式归零，避免上一轮累加值干扰
+
+#### 5.4.2 复现脚本（每段查询独立计数）
+
 `spark-shell --conf spark.sql.hive.metastorePartitionPruningFastFallback=false`
 
 ```scala
 import org.apache.spark.metrics.source.HiveCatalogMetrics
 def fetched(): Long = HiveCatalogMetrics.METRIC_PARTITIONS_FETCHED.getCount
 
-val b0 = fetched()
+// 每段都先 reset，输出的就是这段查询独立的 fetch 数
+HiveCatalogMetrics.reset()
 spark.sql("SELECT * FROM default.t_str WHERE dt = 20260601").collect()
-val b1 = fetched();   println(s"dt = 20260601 (number):  delta=${b1 - b0}")
+println(s"dt = 20260601 (number):       fetched=${fetched()}")
 
+HiveCatalogMetrics.reset()
 spark.sql("SELECT * FROM default.t_str WHERE dt = '20260601'").collect()
-val b2 = fetched();   println(s"dt = '20260601' (string): delta=${b2 - b1}")
+println(s"dt = '20260601' (string):     fetched=${fetched()}")
 
+HiveCatalogMetrics.reset()
 spark.sql("SELECT * FROM default.t_str").collect()
-val b3 = fetched();   println(s"no filter (full scan):    delta=${b3 - b2}")
+println(s"no filter (full scan):        fetched=${fetched()}")
 
+HiveCatalogMetrics.reset()
 spark.sql("SELECT * FROM default.t_str WHERE cast(dt as int) = 20260601").collect()
-val b4 = fetched();   println(s"cast(dt as int) = 20260601: delta=${b4 - b3}")
+println(s"cast(dt as int) = 20260601:   fetched=${fetched()}")
 ```
 
-输出：
+#### 5.4.3 实际跑出的累加值（首次启动 spark-shell，baseline=0）
+
+按累加观察法跑出来的原始数据：
 
 ```
-dt = 20260601 (number):  delta=3       ← ❌ 全拉 3 个分区（不下推）
-dt = '20260601' (string): delta=1      ← ✅ 只拉 1 个（真下推）
-no filter (full scan):    delta=3      ← 全拉（预期）
-cast(dt as int) = 20260601: delta=3    ← ❌ 全拉（与场景 1 等价）
+==== baseline:                                  total=0
+==== after  dt = 20260601  (number literal):    total=3,  delta=3       ← ❌ 全拉 3 个分区（不下推）
+==== after  dt = '20260601' (string literal):   total=4,  delta=1       ← ✅ 只拉 1 个（真下推）
+==== after  no filter (full scan):              total=7,  delta=3       ← 全拉（预期）
+==== after  cast(dt as int) = 20260601:         total=10, delta=3       ← ❌ 全拉（与场景 1 等价）
 ```
 
-**铁实结论**：
+> 注：原始实测脚本未加 `reset()`，看到的是累加值（0 → 3 → 4 → 7 → 10）。**delta 一栏才是各 SQL 独立的 fetch 数**。如果按 5.4.2 推荐的 `reset()` 模式跑，每段直接得 `fetched=3 / 1 / 3 / 3`，跟 delta 完全一致。两种用法等价。
+
+#### 5.4.4 铁实结论
 
 | SQL 谓词 | HMS 实际拉取分区数 | 路径 |
 |---|---|---|
@@ -614,32 +671,36 @@ SHOW PARTITIONS default.t_str;
 EOF
 
 # 2. 跑 metric 实测（必须 spark-shell，spark-sql 读不到 JVM 静态字段）
+# 说明: METRIC_PARTITIONS_FETCHED 是单调累加 Counter，每段查询前先 reset()
 spark-shell --conf spark.sql.hive.metastorePartitionPruningFastFallback=false <<'EOF'
 import org.apache.spark.metrics.source.HiveCatalogMetrics
 def fetched(): Long = HiveCatalogMetrics.METRIC_PARTITIONS_FETCHED.getCount
 
-val b0 = fetched()
+HiveCatalogMetrics.reset()
 spark.sql("SELECT * FROM default.t_str WHERE dt = 20260601").collect()
-val b1 = fetched();   println(s"==== dt = 20260601 (number):  delta=${b1 - b0}")
+println(s"==== dt = 20260601 (number):       fetched=${fetched()}")
 
+HiveCatalogMetrics.reset()
 spark.sql("SELECT * FROM default.t_str WHERE dt = '20260601'").collect()
-val b2 = fetched();   println(s"==== dt = '20260601' (string): delta=${b2 - b1}")
+println(s"==== dt = '20260601' (string):     fetched=${fetched()}")
 
+HiveCatalogMetrics.reset()
 spark.sql("SELECT * FROM default.t_str").collect()
-val b3 = fetched();   println(s"==== no filter:               delta=${b3 - b2}")
+println(s"==== no filter:                    fetched=${fetched()}")
 
+HiveCatalogMetrics.reset()
 spark.sql("SELECT * FROM default.t_str WHERE cast(dt as int) = 20260601").collect()
-val b4 = fetched();   println(s"==== cast(dt as int) = 20260601: delta=${b4 - b3}")
+println(s"==== cast(dt as int) = 20260601:   fetched=${fetched()}")
 EOF
 ```
 
 预期输出：
 
 ```
-==== dt = 20260601 (number):  delta=3
-==== dt = '20260601' (string): delta=1
-==== no filter:               delta=3
-==== cast(dt as int) = 20260601: delta=3
+==== dt = 20260601 (number):       fetched=3
+==== dt = '20260601' (string):     fetched=1
+==== no filter:                    fetched=3
+==== cast(dt as int) = 20260601:   fetched=3
 ```
 
 ---

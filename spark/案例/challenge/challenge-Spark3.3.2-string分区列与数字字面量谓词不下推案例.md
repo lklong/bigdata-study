@@ -3,7 +3,7 @@
 > **审查目标**：本案例 `Spark3.3.2-string分区列与数字字面量谓词不下推案例.md` 的分析过程  
 > **审查角色**：eric（自我 challenge）  
 > **日期**：2026-06-01  
-> **目的**：把分析过程中的 5 处失误、纠错路径、教训沉淀单独归档，与正式案例分离
+> **目的**：把分析过程中的 6 处失误、纠错路径、教训沉淀单独归档，与正式案例分离
 
 ---
 
@@ -128,6 +128,52 @@ TTransportException: Cannot write to null outputStream
 
 ---
 
+### 失误 6：复现脚本未说清 `METRIC_PARTITIONS_FETCHED` 是累加 Counter
+
+**犯错位置**：归档完正式案例后，eric 立刻 challenge："你这个例子不太对，那个分区 count 是个累加值吧"。
+
+**实际真相**：`HiveCatalogMetrics.METRIC_PARTITIONS_FETCHED` 是 codahale `Counter`，**单调递增累加，不会自动 reset**。源码三件套：
+
+> ```70:99:core/src/main/scala/org/apache/spark/metrics/source/StaticSources.scala
+>   val METRIC_PARTITIONS_FETCHED = metricRegistry.counter(MetricRegistry.name("partitionsFetched"))
+>   ...
+>   def reset(): Unit = {
+>     METRIC_PARTITIONS_FETCHED.dec(METRIC_PARTITIONS_FETCHED.getCount())
+>     ...
+>   }
+> ```
+
+> ```105:105:core/src/main/scala/org/apache/spark/metrics/source/StaticSources.scala
+>   def incrementFetchedPartitions(n: Int): Unit = METRIC_PARTITIONS_FETCHED.inc(n)
+> ```
+
+`HiveClientImpl` 两处累加调用：
+
+| 调用点 | 路径 | 触发场景 |
+|---|---|---|
+| `HiveClientImpl.scala:772` | `getPartitions` | 物理执行阶段取裁剪后分区详细元数据 |
+| `HiveClientImpl.scala:784` | `getPartitionsByFilter` | 逻辑优化阶段 PruneHiveTablePartitions 触发的下推/降级路径 |
+
+**Spark 社区自己测试代码（PartitionedTablePerfStatsSuite / OptimizeHiveMetadataOnlyQuerySuite）里都先 `reset()` 再断言绝对值**，证明累加性质是 well-known 的，不是我曲解。
+
+**结论的对错**：实际跑出的 `total=0 → 3 → 4 → 7 → 10`，**delta 一栏（3 / 1 / 3 / 3）刚好就是各 SQL 独立的 fetch 数**，业务结论完全成立。但**复现脚本的可读性有问题**：
+- 别人重启 spark-shell 跑会发现 baseline ≠ 0（如果 spark-shell 启动期 `setupCatalog` 等内部操作触发过分区拉取）→ 困惑
+- 多次连跑同一段会被上一轮累加值干扰
+- 把 `getCount()` 当瞬时值读会误导
+
+**纠错动作**：
+1. 案例文档 §5.4 显式加上"该 metric 累加性质"小节，引用源码三件套
+2. 案例文档复现脚本改成每段查询前 `HiveCatalogMetrics.reset()` 显式归零，输出 `fetched=N` 而不是 `delta=N`，避免读者搞错语义
+3. 保留原始累加观察的输出（0 → 3 → 4 → 7 → 10）作为"真实跑出来什么样"的诚实记录，并解释 delta 等价性
+
+**教训**：
+
+> **凡是用全局 metric / counter / static field 做实测时，必须先确认它的 reset 语义、累加语义、调用点覆盖范围。codahale Counter 默认只能 inc/dec，没有 set；写测试用 reset() 是社区标准做法。复现脚本要让读者一看就懂"这条数到底是这次查询的还是累加的"，绝对不能只输出绝对值让读者自己算。**
+
+---
+
+
+
 ## 二、纠错路径总览
 
 ```mermaid
@@ -150,7 +196,10 @@ flowchart LR
     Q6["metric delta=3<br/>(全拉)<br/>delta=1<br/>(下推)"]:::user
     A6["源码分析方向<br/>完全成立"]:::green
 
-    Q1 --> A1 --> Q2 --> A2 --> Q3 --> A3 --> Q4 --> A4 --> Q5 --> A5 --> Q6 --> A6
+    Q7["eric 追问:<br/>那个 count 是<br/>累加值吧"]:::user
+    A7["确认: 是 codahale Counter<br/>单调累加, 需要 reset()<br/>结论不变, 但脚本写法改进"]:::green
+
+    Q1 --> A1 --> Q2 --> A2 --> Q3 --> A3 --> Q4 --> A4 --> Q5 --> A5 --> Q6 --> A6 --> Q7 --> A7
 
     classDef user fill:#e3f2fd,stroke:#1976d2,color:#000
     classDef red fill:#ffcdd2,stroke:#c62828,color:#000
@@ -202,6 +251,19 @@ flowchart LR
 3. 我有没有忽略 EXPLAIN 之类工具的"假象能力"？
 
 很多看似颠覆的发现，最终都是测试方法或观察方法本身的偏差。**重做实验比重做源码分析便宜得多**。
+
+### 规则 F：用全局 metric / counter 实测时先看 reset 与累加语义
+
+任何用 `HiveCatalogMetrics` / `HiveCatalogMetrics.METRIC_*` / driver 端全局 codahale metric 实测时，必须先做完三件事再写脚本：
+
+1. **看是 Counter / Gauge / Histogram 哪种类型**：Counter 单调累加只能 inc/dec、没有 set；Gauge 是瞬时值；Histogram 有 reservoir
+2. **看 reset 是不是支持**：codahale Counter 没有 reset() 方法，但 Spark `HiveCatalogMetrics.reset()` 用 `dec(getCount())` 模拟实现了一个，**这是 Spark 私有约定不是 codahale 标准**
+3. **看 inc 调用点的覆盖范围**：`incrementFetchedPartitions` 只在 `HiveClientImpl.getPartitions` 与 `getPartitionsByFilter` 两处累加。datasource v2 / file source 的分区拉取**不走这个 metric**
+
+复现脚本的写法：
+- ✅ 每段查询前 `HiveCatalogMetrics.reset()` 显式归零，输出绝对值（语义清晰）
+- ⚠️ 也可以记录 `b0/b1/b2/...` 算 delta（语义等价），但脚本必须显式说明"这是累加值，看 delta 不看 total"
+- ❌ 直接输出 `getCount()` 让读者自己算差，且不说明累加性质（容易误导）
 
 ---
 
